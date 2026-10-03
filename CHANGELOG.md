@@ -56,6 +56,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Core:** a run in which no scene completed cleanly now warns instead of
+  passing silently (survivor bias,
+  [#440](https://github.com/robocurve/inspect-robots/issues/440)). Its status is
+  unchanged, since `fail_on_error` stays the caller's tolerance control, but
+  `eval()` emits a `UserWarning` and the run summary and `inspect` print how
+  many trials the metrics rest on.
+
 - **Setup wizard:** local macOS and Windows sessions no longer default to
   `rerun = false` or print a headless warning just because X11/Wayland display
   variables are absent. SSH sessions without a display still receive the
