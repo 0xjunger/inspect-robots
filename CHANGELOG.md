@@ -56,6 +56,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Core:** Normalize NumPy integer and Boolean metadata scalars in JSON eval
+  logs to prevent `TypeError` serialization crashes on eval completion
+  ([#492](https://github.com/robocurve/inspect-robots/issues/492)).
+
 - **CLI:** Terminate the `ffmpeg` subprocess, close stdin, wait for exit, and unlink partial output if video encoding is interrupted by an escaping exception (e.g. `KeyboardInterrupt`, `MemoryError`) ([#508](https://github.com/robocurve/inspect-robots/issues/508)).
 
 - **Core:** Treat a failed Git working-tree status check as unknown provenance
