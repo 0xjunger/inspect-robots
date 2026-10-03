@@ -600,10 +600,15 @@ export class IssueLedger extends DurableObject<IssueEnv> {
         r.status === "CONFIRMED" &&
         r.serious &&
         r.evidence.length > 0 &&
-        r.limitations.length === 0 &&
         !job.duplicate;
+      // Triage limitations are disclosed, not disqualifying: the plan review, code
+      // review (which requires zero limitations), CI and a human merge gate the fix.
       // The persisted legacy flag records an existing fix PR, not a duplicate issue.
-      const status = job.duplicate ? "FIX_PROPOSED" : r.status;
+      const status = job.duplicate
+        ? "FIX_PROPOSED"
+        : serious
+          ? "FIXING"
+          : r.status;
       this.notice(job, status, r.summary, [...r.evidence, ...r.limitations]);
       job.next = serious ? "plan" : null;
       if (!serious) job.state = "done";
@@ -613,10 +618,16 @@ export class IssueLedger extends DurableObject<IssueEnv> {
       job.plan = r.plan;
       job.next = "plan_review";
     } else if (kind === "plan_review") {
-      if (approve) {
+      // Unlike code review, the plan-review policy never asks for zero limitations;
+      // they are caveats for implementation, not objections. Findings still revise.
+      if (r.status === "APPROVE" && r.findings.length === 0) {
         job.approvedPlan = await digest(s.request.plan);
+        job.feedback = r.limitations.join("\n");
         job.next = "implement";
-      } else if (r.status === "REQUEST_CHANGES" && ++job.planRounds < 3) {
+      } else if (
+        ["REQUEST_CHANGES", "APPROVE"].includes(r.status) &&
+        ++job.planRounds < 3
+      ) {
         job.feedback = [...r.findings, ...r.limitations].join("\n");
         job.next = "plan";
       } else return this.hold(id, "plan_review_not_approved");
