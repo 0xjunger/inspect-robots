@@ -364,7 +364,7 @@ rig; replace the three camera paths with your rig's V4L2 color nodes
 mkdir -p ~/.config/inspect-robots && cat > ~/.config/inspect-robots/config.ini <<'EOF'
 [defaults]
 policy = molmoact2        # from the inspect-robots-yam plugin
-embodiment = yam_arms     # same plugin; cameras configured below
+embodiment = yam_arms     # from the inspect-robots-yam plugin; cameras configured below
 scorer = success_at_end
 max_steps = 1200          # 120 s at 10 Hz
 rerun = true              # live viewer of cameras/state/actions each run
@@ -603,6 +603,11 @@ inspect-robots summarize logs/cubepick-reach_xxxx.json \
 The default endpoint is `https://api.anthropic.com/v1`, and the default API key
 variable is `ANTHROPIC_API_KEY`. Override them with `--base-url URL` and
 `--api-key-env VAR` for another compatible provider.
+
+The request carries every trial's transcript tail (up to 24,000 characters
+each) with no overall limit, so a run with many trials can exceed the model's
+context window and be rejected by the provider. For very large runs, use the
+offline digest or a model with a larger context.
 
 ### Retry with learning
 
