@@ -56,6 +56,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **CLI:** The headless live-view tip no longer prints an IPv6 `SSH_CONNECTION`
+  address that the suggested `view --serve --host 0.0.0.0` (IPv4-only) server
+  cannot answer; it falls back to the host name ([#501](https://github.com/robocurve/inspect-robots/issues/501)).
+
 - **Core:** Normalize NumPy integer and Boolean metadata scalars in JSON eval
   logs to prevent `TypeError` serialization crashes on eval completion
   ([#492](https://github.com/robocurve/inspect-robots/issues/492)).
