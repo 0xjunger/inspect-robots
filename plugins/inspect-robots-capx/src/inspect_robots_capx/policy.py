@@ -11,17 +11,20 @@ from __future__ import annotations
 import atexit
 import contextlib
 import copy
+import hashlib
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Final
 
 import httpx
 import numpy as np
 
 from inspect_robots.embodiment import EmbodimentInfo
+from inspect_robots.errors import ConfigError
 from inspect_robots.policy import PolicyBase, PolicyConfig, PolicyInfo
 from inspect_robots.scene import Scene
 from inspect_robots.spaces import Box
@@ -40,8 +43,21 @@ from inspect_robots_capx._servers import CapxServerClients
 
 _EFFORT_LEVELS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _WIRE_FORMATS = frozenset({"chat", "responses"})
+
+
+# Duplicated from inspect_robots_agent/policy.py; keep the effort contract in sync.
+# The CLI -P parser coerces the literal `none` to Python None, so the constructor
+# needs this marker to tell "operator asked for none" from "operator said nothing".
+class _Unset:
+    """Marker type distinguishing an omitted effort from an explicit one."""
+
+
+_UNSET: Final = _Unset()
 _EXECUTION_REPORT_CHAR_LIMIT = 16_000
 _REPORT_TRUNCATION_MARKER = "[execution report truncated; tail follows]\n"
+
+# Duplicated in inspect_robots_agent/policy.py; keep both limits in sync.
+_PRIOR_LEARNINGS_TEXT_LIMIT = 32 * 1024
 
 _FENCED_CODE = re.compile(r"^```(?:python)?[ \t]*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 _FENCED_ANYWHERE = re.compile(r"```(?:python)?[ \t]*\n(.*?)\n?```", re.DOTALL | re.IGNORECASE)
@@ -111,7 +127,10 @@ class CapxPolicyConfig(PolicyConfig):
     base_url: str | None = None
     api_key_env: str | None = None
     wire: str = "chat"
-    effort: str | None = "low"
+    #: Resolved effort level; ``None`` means the field is omitted and the
+    #: provider default applies. The recorded value is the normalized one, so
+    #: an operator ``none`` reads back as ``"none"`` rather than a bare omission.
+    effort: str | None = None
     sam3_url: str = "http://127.0.0.1:8114"
     graspnet_url: str = "http://127.0.0.1:8115"
     pyroki_url: str = "http://127.0.0.1:8116"
@@ -125,10 +144,18 @@ class CapxPolicyConfig(PolicyConfig):
     request_timeout_s: float = 120.0
     gripper_open_is_high: bool = True
     transcript_echo: bool = False
+    #: Resolved absolute path to the injected prior-learnings file.
+    prior_learnings: str | None = None
+    #: SHA-256 hexdigest of the injected prior-learnings text.
+    prior_learnings_sha256: str | None = None
 
 
 class CapxPolicy(PolicyBase):
-    """Runs a persistent CaP-X-style codegen conversation over a bound joint arm."""
+    """Runs a persistent CaP-X-style codegen conversation over a bound joint arm.
+
+    ``prior_learnings`` optionally loads a UTF-8 notes file once at construction
+    and appends its text to every trial's system prompt.
+    """
 
     def __init__(
         self,
@@ -139,7 +166,7 @@ class CapxPolicy(PolicyBase):
         max_llm_calls: int = 100,
         max_code_failures: int = 3,
         temperature: float | None = None,
-        effort: str | None = "low",
+        effort: str | None | _Unset = _UNSET,
         sam3_url: str = "http://127.0.0.1:8114",
         graspnet_url: str = "http://127.0.0.1:8115",
         pyroki_url: str = "http://127.0.0.1:8116",
@@ -151,9 +178,47 @@ class CapxPolicy(PolicyBase):
         request_timeout_s: float = 120.0,
         gripper_open_is_high: bool = True,
         transcript_echo: bool = False,
+        prior_learnings: str | None = None,
         transport: httpx.BaseTransport | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
+        prior_learnings_path: str | None = None
+        prior_learnings_text: str | None = None
+        prior_learnings_sha256: str | None = None
+        if prior_learnings is not None:
+            if not isinstance(prior_learnings, str) or not prior_learnings:
+                raise ConfigError(
+                    "prior_learnings must be a non-empty filesystem path string, "
+                    f"got {prior_learnings!r}.\n"
+                    "fix: the -P parser coerces unquoted values; pass "
+                    "-P 'prior_learnings=\"path/to/learnings.md\"'"
+                )
+            path = Path(prior_learnings)
+            try:
+                prior_learnings_text = path.read_text(encoding="utf-8")
+                prior_learnings_path = str(path.resolve())
+            except (OSError, UnicodeDecodeError) as exc:
+                raise ConfigError(
+                    f"prior_learnings file {prior_learnings!r} could not be read as UTF-8 "
+                    f"({exc}).\n"
+                    "fix: pass the path to a readable UTF-8 learnings file"
+                ) from exc
+            if not prior_learnings_text.strip():
+                raise ConfigError(
+                    f"prior_learnings file {prior_learnings!r} is empty or whitespace-only.\n"
+                    "fix: add concise notes to the file or omit -P prior_learnings="
+                )
+            if len(prior_learnings_text) > _PRIOR_LEARNINGS_TEXT_LIMIT:
+                raise ConfigError(
+                    f"prior_learnings file {prior_learnings!r} has "
+                    f"{len(prior_learnings_text)} characters; the limit is "
+                    f"{_PRIOR_LEARNINGS_TEXT_LIMIT}.\n"
+                    "fix: summarize it first and pass the path to the shorter learnings file"
+                )
+            prior_learnings_sha256 = hashlib.sha256(
+                prior_learnings_text.encode("utf-8")
+            ).hexdigest()
+
         if max_llm_calls < 1:
             raise ValueError("max_llm_calls must be >= 1")
         if max_code_failures < 1:
@@ -162,11 +227,18 @@ class CapxPolicy(PolicyBase):
             raise ValueError("max_speed_frac must be finite and > 0")
         if not np.isfinite(request_timeout_s) or request_timeout_s <= 0:
             raise ValueError("request_timeout_s must be finite and > 0")
-        if effort is not None and effort not in _EFFORT_LEVELS:
-            raise ValueError(
-                f"effort must be one of {sorted(_EFFORT_LEVELS)}, or None to omit the field, "
-                f"got {effort!r}"
-            )
+        # Unset leaves effort omitted so the provider default applies. A supplied
+        # value normalizes the CLI-coerced None to the level "none" and is then
+        # validated; ConfigError (not ValueError) so the CLI renders a guided
+        # message instead of a traceback (#168).
+        resolved_effort: str | None = None
+        if not isinstance(effort, _Unset):
+            resolved_effort = "none" if effort is None else effort
+            if resolved_effort not in _EFFORT_LEVELS:
+                raise ConfigError(
+                    f"effort must be one of {sorted(_EFFORT_LEVELS)}, got {resolved_effort!r}.\n"
+                    "fix: omit -P effort= to use the provider default"
+                )
         if wire not in _WIRE_FORMATS:
             raise ValueError(f"wire must be one of {sorted(_WIRE_FORMATS)}, got {wire!r}")
 
@@ -197,17 +269,18 @@ class CapxPolicy(PolicyBase):
         self._max_llm_calls = max_llm_calls
         self._max_code_failures = max_code_failures
         self._temperature = temperature
-        self._effort = effort
+        self._effort = resolved_effort
         self._max_speed_frac = max_speed_frac
         self._gripper_open_is_high = gripper_open_is_high
         self._transcript_echo = transcript_echo
+        self._prior_learnings_text = prior_learnings_text
         self.config = CapxPolicyConfig(
             temperature=temperature,
             model=provider.model,
             base_url=provider.base_url,
             api_key_env=api_key_env,
             wire=wire,
-            effort=effort,
+            effort=resolved_effort,
             sam3_url=sam3_url,
             graspnet_url=graspnet_url,
             pyroki_url=pyroki_url,
@@ -221,6 +294,8 @@ class CapxPolicy(PolicyBase):
             request_timeout_s=request_timeout_s,
             gripper_open_is_high=gripper_open_is_high,
             transcript_echo=transcript_echo,
+            prior_learnings=prior_learnings_path,
+            prior_learnings_sha256=prior_learnings_sha256,
         )
         self.info = PolicyInfo(name="capx", action_space=Box(shape=(1,)))
         self._motion: MotionQueue | None = None
@@ -346,6 +421,13 @@ class CapxPolicy(PolicyBase):
         )
         if self._embodiment_docs is not None and self._embodiment_docs.strip():
             system += "\n\nEmbodiment notes:\n" + self._embodiment_docs.strip()
+        if self._prior_learnings_text is not None:
+            system = (
+                system
+                + "\n\nNotes from a previous attempt at tasks like this one. They may "
+                + "be wrong or stale; the current observation always wins:\n"
+                + self._prior_learnings_text
+            )
         self._messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Goal: {scene.instruction}"},

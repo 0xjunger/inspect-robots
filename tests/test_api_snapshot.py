@@ -1,7 +1,7 @@
 """Guard the public API surface against accidental growth/shrinkage.
 
-If you intend to change the public API, update ``EXPECTED`` here and note it in
-the changelog. Everything not in ``inspect_robots.__all__`` (or prefixed ``_``) is
+If you intend to change the public API, update ``EXPECTED`` here and add a changelog
+fragment in ``changelog.d/``. Everything not in ``inspect_robots.__all__`` (or prefixed ``_``) is
 private and carries no stability guarantee.
 """
 
@@ -13,6 +13,7 @@ EXPECTED = {
     # evaluation + logs
     "eval",
     "eval_set",
+    "generate_scene",
     "read_eval_log",
     "EvalLog",
     "EvalResults",
@@ -33,6 +34,12 @@ EXPECTED = {
     "min_distance_to_goal",
     "reached_goal_state",
     "operator_scorer",
+    "operator_input",
+    "is_affirmative_verdict",
+    # judgement capture (plans 0049 and 0069)
+    "Grader",
+    "operator_grader",
+    "vlm_grader",
     # the two swappable inputs
     "Policy",
     "PolicyBase",
@@ -41,10 +48,18 @@ EXPECTED = {
     "Embodiment",
     "EmbodimentBase",
     "EmbodimentInfo",
+    # attended operator input
+    "OperatorInput",
+    "OperatorConsole",
+    "OperatorSession",
+    "ConsolePoll",
+    "EndRequest",
     # types & spaces
+    "ABSOLUTE_CONTROL_MODES",
     "Observation",
     "Action",
     "ActionChunk",
+    "OPERATOR_END",
     "StepResult",
     "Box",
     "ActionSemantics",
@@ -57,9 +72,12 @@ EXPECTED = {
     "policy",
     "embodiment",
     "scorer",
+    "grader",
     "sink",
     "registered",
     "resolve",
+    # public submodules
+    "defaults",
     # meta
     "__version__",
 }

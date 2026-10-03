@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -16,7 +18,13 @@ from inspect_robots.frames import FrameStore
 from inspect_robots.logging.sink import NullSink
 from inspect_robots.mock import CubePickEmbodiment, ScriptedPolicy
 from inspect_robots.policy import PolicyBase, PolicyConfig, PolicyInfo
-from inspect_robots.rollout import TrialRecord, derive_seed, rollout
+from inspect_robots.rollout import (
+    TrialRecord,
+    _connection_failure,
+    _policy_error,
+    derive_seed,
+    rollout,
+)
 from inspect_robots.scene import Scene
 from inspect_robots.scorer import success_at_end
 from inspect_robots.spaces import ActionSemantics, Box
@@ -255,12 +263,20 @@ def test_frame_store_sanitizes_without_collisions(tmp_path: Path) -> None:
 def test_frame_store_streams_to_disk(tmp_path: Path) -> None:
     store = FrameStore(str(tmp_path / "frames"))
     record = _run(ScriptedPolicy(), CubePickEmbodiment(), frame_store=store)
-    assert store.count > 0
+    assert store.count == len(record.steps) + 1
     first = record.steps[0]
-    assert not first.observation.images  # images stripped from the record
+    assert not first.observation.images
+    assert not first.result.observation.images
     assert first.image_refs is not None and "top" in first.image_refs
+    assert first.result_image_refs is not None and "top" in first.result_image_refs
+    assert first.image_refs["top"].t == 0
+    assert first.result_image_refs["top"].t == 1
     loaded = first.image_refs["top"].load()
     assert loaded.shape == (32, 32, 3)
+    terminal = record.steps[-1]
+    assert terminal.result_image_refs is not None
+    assert terminal.result_image_refs["top"].t == terminal.t + 1
+    assert terminal.result_image_refs["top"].load().shape == (32, 32, 3)
 
 
 def test_per_trial_seed_varies_by_epoch() -> None:
@@ -407,6 +423,73 @@ def test_wrong_dim_action_attributed_to_policy() -> None:
     assert rec is not None and rec.status == "error"
 
 
+class _BadDataPolicy(_WrongDimPolicy):
+    def __init__(self, data: object) -> None:
+        super().__init__()
+        self.data = data
+
+    def act(self, observation: Observation) -> ActionChunk:
+        del observation
+        return ActionChunk(actions=[Action(data=self.data)])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+def test_non_finite_action_attributed_to_policy(value: float) -> None:
+    embodiment = CubePickEmbodiment()
+    step = Mock(wraps=embodiment.step)
+
+    with (
+        patch.object(embodiment, "step", step),
+        pytest.raises(PolicyError, match="non-finite") as excinfo,
+    ):
+        _run(_BadDataPolicy(np.array([value, 0.0])), embodiment)
+
+    record = excinfo.value.record
+    assert record is not None and record.status == "error"
+    step.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        np.array([object(), 1.0], dtype=object),
+        np.array(["a", "b"]),
+        np.array([10**400, 1.0], dtype=object),
+    ],
+)
+def test_non_numeric_action_attributed_to_policy(data: object) -> None:
+    embodiment = CubePickEmbodiment()
+    step = Mock(wraps=embodiment.step)
+
+    with (
+        patch.object(embodiment, "step", step),
+        pytest.raises(PolicyError, match="non-finite") as excinfo,
+    ):
+        _run(_BadDataPolicy(data), embodiment)
+
+    record = excinfo.value.record
+    assert record is not None and record.status == "error"
+    step.assert_not_called()
+
+
+def test_approver_introduced_non_finite_action_is_a_safety_abort() -> None:
+    class _NonFiniteApprover:
+        def review(self, action: Action, store: dict[str, object]) -> Action:
+            del store
+            return replace(action, data=np.array([np.nan, 0.0]))
+
+    embodiment = CubePickEmbodiment()
+    step = Mock(wraps=embodiment.step)
+
+    with (
+        patch.object(embodiment, "step", step),
+        pytest.raises(SafetyAbort, match="non-finite"),
+    ):
+        _run(ScriptedPolicy(), embodiment, approver=_NonFiniteApprover())
+
+    step.assert_not_called()
+
+
 # --------------------------------------------------------------------------- #
 # Approval events: a modified action is recorded in the transcript.
 # --------------------------------------------------------------------------- #
@@ -433,6 +516,101 @@ def test_modified_action_records_approval_event_without_detail() -> None:
     assert approvals[0].data["detail"] is None
 
 
+def test_rollout_surfaces_approvals_in_observation_extra() -> None:
+    class _ObsCapturingPolicy:
+        def __init__(self) -> None:
+            self.info = PolicyInfo(name="capturer", action_space=_BOX)
+            self.config = PolicyConfig()
+            self.captured_extras: list[dict[str, object]] = []
+
+        def reset(self, scene: Scene) -> None:
+            self.captured_extras.clear()
+
+        def act(self, observation: Observation) -> ActionChunk:
+            # Capture a deep copy of observation.extra to inspect what policy was given
+            import copy
+
+            self.captured_extras.append(copy.deepcopy(dict(observation.extra)))
+            # Mutate extra dict to verify rollout store is not corrupted by policy
+            if (
+                isinstance(observation.extra.get("approvals"), list)
+                and observation.extra["approvals"]
+            ):
+                observation.extra["approvals"][0]["detail"] = "corrupted"
+            # Emit 2 actions per chunk so step 0 & 1 happen between act() calls
+            act1 = Action(data=np.array([1.0, 1.0]))
+            act2 = Action(data=np.array([1.0, 1.0]))
+            return ActionChunk(actions=[act1, act2])
+
+    space = Box(shape=(2,), low=np.array([-0.05, -0.05]), high=np.array([0.05, 0.05]))
+    policy = _ObsCapturingPolicy()
+    _run(policy, CubePickEmbodiment(), approver=ClampApprover(space))
+    assert len(policy.captured_extras) > 1
+    # First inference sees empty approvals (step 0 hasn't approved anything yet)
+    assert policy.captured_extras[0]["approvals"] == []
+    # Second inference sees only the approvals since the previous act() (steps 0 & 1)
+    second_approvals = policy.captured_extras[1]["approvals"]
+    assert isinstance(second_approvals, list) and len(second_approvals) == 2
+    assert second_approvals[0] == {"t": 0, "detail": "clamped"}
+    assert second_approvals[1] == {"t": 1, "detail": "clamped"}
+    # Third inference sees windowed approvals since second act() (steps 2 & 3)
+    if len(policy.captured_extras) > 2:
+        third_approvals = policy.captured_extras[2]["approvals"]
+        assert isinstance(third_approvals, list) and len(third_approvals) == 2
+        assert third_approvals[0] == {"t": 2, "detail": "clamped"}
+
+
+def test_non_finite_policy_action_errors_one_scene_and_eval_continues(
+    tmp_path: Path,
+) -> None:
+    class _NaNOncePolicy(ScriptedPolicy):
+        def __init__(self) -> None:
+            super().__init__()
+            self.total_act_calls = 0
+
+        def act(self, observation: Observation) -> ActionChunk:
+            self.total_act_calls += 1
+            if self.total_act_calls == 1:
+                return ActionChunk(actions=[Action(data=np.array([np.nan, 0.0]))])
+            return super().act(observation)
+
+    class _ClampReviewSpy(ClampApprover):
+        def __init__(self, action_space: Box) -> None:
+            super().__init__(action_space)
+            self.finite_reviews: list[bool] = []
+
+        def review(self, action: Action, store: dict[str, Any]) -> Action:
+            self.finite_reviews.append(bool(np.isfinite(action.data).all()))
+            return super().review(action, store)
+
+    task = Task(
+        name="two-scenes",
+        scenes=[Scene(id=f"s{i}", instruction="reach") for i in range(2)],
+        scorer=success_at_end(),
+        max_steps=20,
+    )
+    embodiment = CubePickEmbodiment()
+    approver = _ClampReviewSpy(embodiment.info.action_space)
+
+    (log,) = eval(
+        task,
+        _NaNOncePolicy(),
+        embodiment,
+        log_dir=str(tmp_path),
+        fail_on_error=False,
+        approver=approver,
+    )
+
+    assert log.status != "error"
+    assert len(log.samples) == 2
+    assert log.samples[0].status == "error"
+    assert log.samples[0].error is not None
+    assert "PolicyError" in log.samples[0].error
+    assert "non-finite" in log.samples[0].error
+    assert log.samples[1].status == "success"
+    assert approver.finite_reviews and all(approver.finite_reviews)
+
+
 def test_fail_on_error_proportion_halts(tmp_path: Path) -> None:
     task = Task(
         name="t",
@@ -440,9 +618,48 @@ def test_fail_on_error_proportion_halts(tmp_path: Path) -> None:
         scorer=success_at_end(),
         max_steps=20,
     )
-    # Every trial raises -> proportion 1.0 >= 0.5 threshold -> eval status error.
+    # Every trial raises -> the 0.5 threshold is reached at 2 of 4 planned trials.
     logs = eval(task, _BoomPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path), fail_on_error=0.5)
     assert logs[0].status == "error"
+
+
+class _BoomOncePolicy(_BoomPolicy):
+    """Raises only while running the first scene."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._scene_id = ""
+
+    def reset(self, scene: Scene) -> None:
+        self._scene_id = scene.id
+        return None
+
+    def act(self, observation: Observation) -> ActionChunk:
+        if self._scene_id == "s0":
+            raise RuntimeError("inference exploded")
+        return ScriptedPolicy().act(observation)
+
+
+def test_fail_on_error_proportion_tolerates_errors_below_the_threshold(
+    tmp_path: Path,
+) -> None:
+    """1 error in 4 planned trials is 25%, under a 0.5 threshold, so the eval runs on (#254)."""
+    task = Task(
+        name="t",
+        scenes=[Scene(id=f"s{i}", instruction="x") for i in range(4)],
+        scorer=success_at_end(),
+        max_steps=20,
+    )
+    logs = eval(
+        task, _BoomOncePolicy(), CubePickEmbodiment(), log_dir=str(tmp_path), fail_on_error=0.5
+    )
+
+    log = logs[0]
+    # The denominator is the planned trial count, so one failure no longer reads
+    # as 1/1 = 100% and halt the run after the very first trial.
+    assert log.status != "error"
+    assert [s.scene_id for s in log.samples] == ["s0", "s1", "s2", "s3"]
+    assert [s.status for s in log.samples] == ["error", "success", "success", "success"]
 
 
 # --------------------------------------------------------------------------- #
@@ -559,3 +776,155 @@ def test_oversized_policy_transcript_becomes_dropped_marker() -> None:
         "bytes": 2 * 1024 * 1024 + 2,
         "note": "exceeds inline limit; policies must not embed binary data",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Connection failures: actionable policy-server hints without dependency coupling.
+# --------------------------------------------------------------------------- #
+class _ResetConnectionPolicy(_BoomPolicy):
+    def reset(self, scene: Scene) -> None:
+        raise ConnectionRefusedError("connection refused")
+
+
+def test_policy_reset_connection_failure_records_neutral_hint() -> None:
+    with pytest.raises(PolicyError) as excinfo:
+        _run(_ResetConnectionPolicy(), CubePickEmbodiment())
+
+    assert str(excinfo.value) == (
+        "connection refused\n"
+        "hint: policy 'boom' hit a connection failure — "
+        "a backend it depends on may be down or unreachable."
+    )
+    assert excinfo.value.record is not None
+
+
+def test_named_connection_error_chain_records_url_and_remedy_hint() -> None:
+    class NewConnectionError(Exception):
+        pass
+
+    class ConnectionError(Exception):
+        pass
+
+    class _ServerPolicy(_BoomPolicy):
+        def __init__(self) -> None:
+            super().__init__()
+            self.info = PolicyInfo(name="server-backed", action_space=_BOX)
+            self.server_url = "http://127.0.0.1:8202"
+            self.remedy = "start the test action server, then rerun"
+
+        def act(self, observation: Observation) -> ActionChunk:
+            try:
+                raise NewConnectionError("connection refused")
+            except NewConnectionError as exc:
+                raise ConnectionError("pool failed") from exc
+
+    with pytest.raises(PolicyError) as excinfo:
+        _run(_ServerPolicy(), CubePickEmbodiment())
+
+    assert str(excinfo.value) == (
+        "pool failed\n"
+        "hint: policy 'server-backed' could not hold a connection to its "
+        "action server at http://127.0.0.1:8202 — is the server up and healthy? "
+        "Start (or restart) it, then rerun.\n"
+        "hint: start the test action server, then rerun"
+    )
+
+
+def test_non_connection_policy_failure_has_no_hint() -> None:
+    class _ValueErrorPolicy(_BoomPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            raise ValueError("bad response")
+
+    with pytest.raises(PolicyError) as excinfo:
+        _run(_ValueErrorPolicy(), CubePickEmbodiment())
+
+    assert str(excinfo.value) == "bad response"
+    assert "hint:" not in str(excinfo.value)
+
+
+def test_connection_failure_context_cycle_terminates() -> None:
+    exc = ValueError("cycle")
+    exc.__context__ = exc
+    assert _connection_failure(exc) is False
+
+
+def test_max_retry_error_chained_to_timeout_is_not_connection_failure() -> None:
+    class MaxRetryError(Exception):
+        pass
+
+    exc = MaxRetryError("retries exhausted")
+    exc.__cause__ = TimeoutError("server was slow")
+    assert _connection_failure(exc) is False
+    assert "hint:" not in str(_policy_error(_BoomPolicy(), exc))
+
+
+def test_connection_failure_respects_suppressed_context() -> None:
+    suppressed: ValueError
+    try:
+        raise ConnectionError("connection refused")
+    except ConnectionError:
+        try:
+            raise ValueError("wrapper") from None
+        except ValueError as exc:
+            suppressed = exc
+
+    unsuppressed: ValueError
+    try:
+        raise ConnectionError("connection refused")
+    except ConnectionError:
+        try:
+            raise ValueError("wrapper")
+        except ValueError as exc:
+            unsuppressed = exc
+
+    assert "hint:" not in str(_policy_error(_BoomPolicy(), suppressed))
+    assert "hint:" in str(_policy_error(_BoomPolicy(), unsuppressed))
+
+
+def test_policy_error_handles_each_optional_server_hint_attribute() -> None:
+    class _UrlOnlyPolicy(_BoomPolicy):
+        server_url = "http://127.0.0.1:9000"
+
+    class _RemedyOnlyPolicy(_BoomPolicy):
+        remedy = "start the local backend"
+
+    url_only = str(_policy_error(_UrlOnlyPolicy(), ConnectionError("refused")))
+    remedy_only = str(_policy_error(_RemedyOnlyPolicy(), ConnectionError("refused")))
+
+    assert "action server at http://127.0.0.1:9000" in url_only
+    assert url_only.count("\nhint:") == 1
+    assert "a backend it depends on may be down or unreachable." in remedy_only
+    assert remedy_only.endswith("\nhint: start the local backend")
+
+
+def test_raising_server_url_property_does_not_mask_policy_failure() -> None:
+    class _RaisingServerUrlPolicy(_BoomPolicy):
+        @property
+        def server_url(self) -> str:
+            raise RuntimeError("property exploded")
+
+        def reset(self, scene: Scene) -> None:
+            raise ConnectionRefusedError("base connection failure")
+
+    with pytest.raises(PolicyError) as excinfo:
+        _run(_RaisingServerUrlPolicy(), CubePickEmbodiment())
+
+    assert str(excinfo.value) == "base connection failure"
+    assert excinfo.value.record is not None
+    assert excinfo.value.record.error == "PolicyError: base connection failure"
+
+
+@pytest.mark.parametrize("invalid_steps", [0, -1, True, False, 2.5, "10"])
+def test_rollout_rejects_invalid_max_steps(invalid_steps: Any) -> None:
+    with pytest.raises(ValueError, match="max_steps must be an integer >= 1"):
+        rollout(
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            _SCENE,
+            max_steps=invalid_steps,
+            seed=0,
+            epoch=0,
+            controller=DefaultController(),
+            approver=AutoApprover(),
+            sink=NullSink(),
+        )

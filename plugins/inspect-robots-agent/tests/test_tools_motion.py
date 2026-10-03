@@ -7,6 +7,7 @@ from itertools import pairwise
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 from inspect_robots.approver import ChainApprover, ClampApprover, DeltaLimitApprover
@@ -19,7 +20,7 @@ from inspect_robots.spaces import (
     StateField,
     StateSpec,
 )
-from inspect_robots.types import Observation
+from inspect_robots.types import Action, Observation
 from inspect_robots_agent._llm import ToolCall
 from inspect_robots_agent._tools import ToolResult, ToolsetError, build_toolset
 
@@ -60,6 +61,21 @@ def _absolute_space(
 
 def _absolute_obs_space(dim: int = 1, key: str = "q") -> ObservationSpace:
     return ObservationSpace(state=StateSpec(fields=(StateField(key=key, shape=(dim,)),)))
+
+
+def _declaring_space(
+    max_step: tuple[float | None, float | None] = (None, 0.1),
+) -> Box:
+    return Box(
+        shape=(2,),
+        low=np.array([-1.0, 0.0]),
+        high=np.array([1.0, 1.0]),
+        semantics=ActionSemantics(
+            "joint_pos",
+            dim_labels=("joint", "gripper"),
+            max_step=max_step,
+        ),
+    )
 
 
 def _camera_obs_space() -> ObservationSpace:
@@ -141,6 +157,27 @@ def test_build_refuses_unsupported_configurations() -> None:
         build_toolset(quat, _bimanual_obs_space(), control_hz=10.0)
 
 
+def test_pre_check_refuses_displacement_modes_only_when_configured() -> None:
+    def allow(waypoints: npt.NDArray[np.float64]) -> str | None:
+        return None
+
+    with pytest.raises(ToolsetError, match=r"displacement.*plan 0031"):
+        build_toolset(
+            _delta_space(),
+            ObservationSpace(),
+            control_hz=10.0,
+            pre_check=allow,
+        )
+
+    build_toolset(
+        _absolute_space(),
+        _absolute_obs_space(),
+        control_hz=10.0,
+        pre_check=allow,
+    )
+    build_toolset(_delta_space(), ObservationSpace(), control_hz=10.0)
+
+
 def test_absolute_mode_requires_exactly_one_aligned_state_field() -> None:
     space = _bimanual_space()
     with pytest.raises(ToolsetError, match="StateSpec"):
@@ -155,6 +192,31 @@ def test_absolute_mode_requires_exactly_one_aligned_state_field() -> None:
     )
     with pytest.raises(ToolsetError, match="exactly one"):
         build_toolset(space, two_match, control_hz=10.0)
+
+
+def test_same_shaped_state_fields_disambiguate_by_control_mode_family() -> None:
+    # A 14-D Cartesian embodiment (x, y, z, yaw, pitch, roll, gripper per arm)
+    # legitimately exposes joint_pos and eef_state at the same shape; the
+    # canonical key family of the control mode picks the aligned field.
+    both = ObservationSpace(
+        state=StateSpec(
+            fields=(
+                StateField(key="joint_pos", shape=(14,)),
+                StateField(key="eef_state", shape=(14,)),
+            )
+        )
+    )
+    joint = build_toolset(_bimanual_space(), both, control_hz=10.0)
+    assert joint.state_labels()[0] == "joint_pos"
+
+    eef_space = Box(
+        shape=(14,),
+        low=np.array([-1.0] * 14),
+        high=np.array([1.0] * 14),
+        semantics=ActionSemantics("eef_abs_pose", dim_labels=_ARM_LABELS),
+    )
+    eef = build_toolset(eef_space, both, control_hz=10.0)
+    assert eef.state_labels()[0] == "eef_state"
 
 
 def test_absolute_mode_labels_its_reference_even_when_the_key_is_noncanonical() -> None:
@@ -308,10 +370,18 @@ def test_build_rejects_degenerate_derivations() -> None:
     with pytest.raises(ToolsetError, match="too large to derive a playout cap"):
         build_toolset(_delta_space(), ObservationSpace(), control_hz=1e308)
 
-    with pytest.raises(ToolsetError, match="underflows to a zero per-step limit"):
+    with pytest.raises(ToolsetError, match="underflows the derived per-step limit"):
         build_toolset(
             _absolute_space(),
             _absolute_obs_space(),
+            control_hz=10.0,
+            max_speed_frac=5e-324,
+        )
+
+    with pytest.raises(ToolsetError, match="underflows to a zero per-step limit"):
+        build_toolset(
+            _delta_space(),
+            ObservationSpace(),
             control_hz=10.0,
             max_speed_frac=5e-324,
         )
@@ -381,6 +451,133 @@ def test_low_precision_bounds_never_outrun_native_backstop() -> None:
         assert chain.review(action, store) is action
 
 
+def test_declared_step_paces_gripper_while_undeclared_joint_is_unchanged() -> None:
+    space = _declaring_space()
+    toolset = build_toolset(space, _absolute_obs_space(dim=2), control_hz=10.0)
+    observation = _obs({"q": np.array([0.0, 0.0])})
+
+    gripper = toolset.execute(
+        _call("move_joints", targets={"gripper": 1.0}),
+        observation,
+    )
+    joint = toolset.execute(
+        _call("move_joints", targets={"joint": 1.0}),
+        observation,
+    )
+
+    assert gripper.error is None and gripper.chunk is not None
+    assert len(gripper.chunk.actions) == 11
+    assert joint.error is None and joint.chunk is not None
+    assert len(joint.chunk.actions) == 51
+
+    undeclared = Box(
+        shape=(2,),
+        low=space.low,
+        high=space.high,
+        semantics=ActionSemantics("joint_pos", dim_labels=("joint", "gripper")),
+    )
+    old_toolset = build_toolset(undeclared, _absolute_obs_space(dim=2), control_hz=10.0)
+    old_full_stroke = old_toolset.execute(
+        _call("move_joints", targets={"gripper": 1.0}),
+        observation,
+    )
+    assert old_full_stroke.chunk is None
+    assert old_full_stroke.error is not None
+    assert "playout cap" in old_full_stroke.error
+
+
+@pytest.mark.parametrize(
+    ("max_speed_frac", "expected_steps"),
+    [(0.05, 21), (0.2, 11)],
+)
+def test_declared_step_scales_down_but_not_above_its_ceiling(
+    max_speed_frac: float,
+    expected_steps: int,
+) -> None:
+    toolset = build_toolset(
+        _declaring_space(),
+        _absolute_obs_space(dim=2),
+        control_hz=10.0,
+        max_speed_frac=max_speed_frac,
+    )
+    result = toolset.execute(
+        _call("move_joints", targets={"gripper": 1.0}),
+        _obs({"q": np.array([0.0, 0.0])}),
+    )
+
+    assert result.error is None and result.chunk is not None
+    assert len(result.chunk.actions) == expected_steps
+
+
+def test_combined_declared_move_uses_largest_per_dimension_step_count() -> None:
+    toolset = build_toolset(
+        _declaring_space(),
+        _absolute_obs_space(dim=2),
+        control_hz=10.0,
+    )
+    result = toolset.execute(
+        _call("move_joints", targets={"joint": 0.4, "gripper": 1.0}),
+        _obs({"q": np.array([0.0, 0.0])}),
+    )
+
+    assert result.error is None and result.chunk is not None
+    assert len(result.chunk.actions) == 21
+
+
+def test_declared_step_is_the_float_spacing_guard_budget() -> None:
+    space = Box(
+        shape=(1,),
+        low=np.array([1e9]),
+        high=np.array([1e9 + 100.0]),
+        semantics=ActionSemantics(
+            "joint_pos",
+            dim_labels=("joint",),
+            max_step=(0.1,),
+        ),
+    )
+
+    with pytest.raises(ToolsetError, match="too coarse at this magnitude"):
+        build_toolset(space, _absolute_obs_space(), control_hz=10.0)
+
+
+def test_declared_step_pacing_underflow_hits_movable_zero_limit_guard() -> None:
+    space = Box(
+        shape=(1,),
+        low=np.array([0.0]),
+        high=np.array([1e-300]),
+        semantics=ActionSemantics(
+            "joint_pos",
+            dim_labels=("joint",),
+            max_step=(1e-300,),
+        ),
+    )
+
+    with pytest.raises(ToolsetError, match="underflows the derived per-step limit"):
+        build_toolset(
+            space,
+            _absolute_obs_space(),
+            control_hz=10.0,
+            max_speed_frac=1e-300,
+        )
+
+
+def test_declared_step_chunks_pass_the_default_delta_approver_unmodified() -> None:
+    space = _declaring_space()
+    toolset = build_toolset(space, _absolute_obs_space(dim=2), control_hz=10.0)
+    start = np.array([0.0, 0.0])
+    result = toolset.execute(
+        _call("move_joints", targets={"gripper": 1.0}),
+        _obs({"q": start}),
+    )
+    assert result.chunk is not None
+
+    approver = DeltaLimitApprover(space)
+    store: dict[str, Any] = {}
+    approver.review(Action(data=start), store)
+    for action in result.chunk.actions:
+        assert approver.review(action, store) is action
+
+
 @pytest.mark.parametrize("max_speed_frac", [0.0, -0.1, float("inf"), float("nan")])
 def test_build_rejects_invalid_max_speed_frac(max_speed_frac: float) -> None:
     with pytest.raises(ToolsetError, match="max_speed_frac must be finite and > 0"):
@@ -405,8 +602,8 @@ def test_schemas_match_control_mode_and_remove_duration() -> None:
     absolute_parameters = [schema["function"]["parameters"] for schema in absolute.schemas()]
     assert [parameters["required"] for parameters in absolute_parameters] == [
         ["targets", "note"],
-        ["summary"],
-        ["reason"],
+        ["summary", "hindsight"],
+        ["reason", "hindsight"],
     ]
     assert absolute_parameters[0]["properties"]["note"] == {
         "type": "string",
@@ -428,10 +625,29 @@ def test_schemas_match_control_mode_and_remove_duration() -> None:
     ]
     assert [parameters["required"] for parameters in displacement_parameters] == [
         ["deltas", "note"],
-        ["summary"],
-        ["reason"],
+        ["summary", "hindsight"],
+        ["reason", "hindsight"],
     ]
     assert displacement_parameters[0]["properties"]["note"]["type"] == "string"
+
+
+def test_stop_schemas_describe_required_hindsight() -> None:
+    toolset = build_toolset(_delta_space(), ObservationSpace(), control_hz=10.0)
+    expected_description = (
+        "What do you know now that you wish you had known at the start of this episode? "
+        "Concrete, transferable facts about this rig, task, or embodiment (camera mounting "
+        "and extrinsics, table and base geometry, gripper axis and offsets, controller "
+        "behavior, metric scale), written as advice to a future agent attempting the same "
+        "task. Say 'none' if nothing qualifies."
+    )
+
+    for schema, detail_key in zip(toolset.schemas()[1:], ("summary", "reason"), strict=True):
+        parameters = schema["function"]["parameters"]
+        assert parameters["required"] == [detail_key, "hindsight"]
+        assert parameters["properties"]["hindsight"] == {
+            "type": "string",
+            "description": expected_description,
+        }
 
 
 def test_take_pic_schema_is_exposed_only_on_demand() -> None:
@@ -589,6 +805,66 @@ def test_move_joints_clips_every_interpolant_into_box() -> None:
     )
     assert result.error is None and result.chunk is not None
     assert all(-1.0 <= float(action.data[0]) <= 0.3 for action in result.chunk.actions)
+
+
+def test_pre_check_receives_exact_read_only_clipped_waypoints_once() -> None:
+    low = np.array([-1.0, -0.5])
+    high = np.array([0.3, 0.5])
+    space = Box(
+        shape=(2,),
+        low=low,
+        high=high,
+        semantics=ActionSemantics("joint_pos", dim_labels=("a", "b")),
+    )
+    received: list[npt.NDArray[np.float64]] = []
+
+    def allow(waypoints: npt.NDArray[np.float64]) -> str | None:
+        assert waypoints.dtype == np.float64
+        assert waypoints.ndim == 2
+        assert waypoints.shape[1] == 2
+        assert waypoints.flags.writeable is False
+        assert bool(np.all(waypoints >= low))
+        assert bool(np.all(waypoints <= high))
+        assert np.array_equal(waypoints[-1], np.array([0.3, 0.4]))
+        with pytest.raises(ValueError):
+            waypoints[0, 0] = 0.0
+        received.append(waypoints.copy())
+        return None
+
+    toolset = build_toolset(
+        space,
+        _absolute_obs_space(dim=2),
+        control_hz=10.0,
+        pre_check=allow,
+    )
+    result = toolset.execute(
+        _call("move_joints", targets={"a": 0.3, "b": 0.4}),
+        _obs({"q": np.array([-0.1, 0.0])}),
+    )
+
+    assert result.error is None and result.chunk is not None
+    emitted = np.stack([action.data for action in result.chunk.actions])
+    assert len(received) == 1
+    assert np.array_equal(received[0], emitted)
+
+
+def test_pre_check_rejection_returns_a_tool_error_without_a_chunk() -> None:
+    def reject(waypoints: npt.NDArray[np.float64]) -> str | None:
+        return "left_wrist:table at waypoint 4"
+
+    toolset = build_toolset(
+        _absolute_space(),
+        _absolute_obs_space(),
+        control_hz=10.0,
+        pre_check=reject,
+    )
+    result = toolset.execute(
+        _call("move_joints", targets={"joint": 0.3}),
+        _obs(),
+    )
+
+    assert result.error == ("pre-check rejected this motion: left_wrist:table at waypoint 4")
+    assert result.chunk is None
 
 
 def test_move_joints_headroom_stays_within_default_backstop() -> None:
@@ -910,23 +1186,74 @@ def test_valid_move_note_does_not_change_the_motion_chunk() -> None:
 
 
 def test_done_and_give_up_emit_control_mode_hold() -> None:
-    absolute = build_toolset(_bimanual_space(), _bimanual_obs_space(), control_hz=10.0)
-    state = np.full(14, 0.3)
-    result = absolute.execute(
-        _call("done", summary="fork placed"),
-        Observation(state={"joint_pos": state}),
+    calls = 0
+
+    def reject(waypoints: npt.NDArray[np.float64]) -> str | None:
+        nonlocal calls
+        calls += 1
+        return "all motion rejected"
+
+    absolute = build_toolset(
+        _bimanual_space(),
+        _bimanual_obs_space(),
+        control_hz=10.0,
+        pre_check=reject,
     )
-    assert result.error is None and result.chunk is not None
-    (action,) = result.chunk.actions
-    assert np.array_equal(action.data, state)
-    assert action.meta["request_stop"] is True
-    assert action.meta["stop_reason"] == "done"
+    state = np.full(14, 0.3)
+    for name, detail_key in (("done", "summary"), ("give_up", "reason")):
+        result = absolute.execute(
+            _call(name, **{detail_key: "fork placed"}),
+            Observation(state={"joint_pos": state}),
+        )
+        assert result.error is None and result.chunk is not None
+        (action,) = result.chunk.actions
+        assert np.array_equal(action.data, state)
+        assert action.meta["request_stop"] is True
+        assert action.meta["stop_reason"] == name
+    assert calls == 0
 
     displacement = build_toolset(_delta_space(), ObservationSpace(), control_hz=10.0)
     result = displacement.execute(_call("give_up", reason="cannot see"), _obs({}))
     assert result.chunk is not None
     assert np.array_equal(result.chunk.actions[0].data, np.zeros(2))
     assert result.chunk.actions[0].meta["stop_reason"] == "give_up"
+
+
+def test_done_carries_hindsight_in_stop_meta() -> None:
+    toolset = build_toolset(_absolute_space(), _absolute_obs_space(), control_hz=10.0)
+    hindsight = "the jar lid needs two approach angles"
+
+    result = toolset.execute(
+        _call("done", summary="jar opened", hindsight=hindsight),
+        _obs(),
+    )
+
+    assert result.error is None and result.chunk is not None
+    (action,) = result.chunk.actions
+    assert action.meta == {
+        "request_stop": True,
+        "stop_reason": "done",
+        "stop_detail": "jar opened",
+        "stop_hindsight": hindsight,
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{"reason": "cannot see"}, {"reason": "cannot see", "hindsight": "  "}],
+)
+def test_give_up_accepts_absent_or_blank_hindsight(arguments: dict[str, object]) -> None:
+    toolset = build_toolset(_delta_space(), ObservationSpace(), control_hz=10.0)
+
+    result = toolset.execute(_call("give_up", **arguments), _obs({}))
+
+    assert result.error is None and result.chunk is not None
+    assert result.chunk.actions[0].meta == {
+        "request_stop": True,
+        "stop_reason": "give_up",
+        "stop_detail": "cannot see",
+    }
+    assert result.note == "give_up: cannot see"
 
 
 def test_tool_errors_are_messages_not_exceptions() -> None:
@@ -1040,3 +1367,13 @@ def test_displacement_pose_mode_keeps_move_by() -> None:
     move = toolset.schemas()[0]["function"]
     assert move["name"] == "move_by"
     assert move["description"].startswith("Move BY")
+
+
+def test_chunk_final_metadata_tagged_on_last_action() -> None:
+    result = _execute_absolute(0.5, current=0.0)
+    assert result.chunk is not None
+    actions = result.chunk.actions
+    assert len(actions) > 1
+    for action in actions[:-1]:
+        assert "chunk_final" not in action.meta
+    assert actions[-1].meta.get("chunk_final") is True

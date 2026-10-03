@@ -24,9 +24,9 @@ inspect-robots "pick up the cube" --policy agent \
 Model strings are OpenRouter-style `provider/model`, resolved from
 `-P model=...` or `$INSPECT_ROBOTS_MODEL`. API keys come from the environment:
 
-1. `-P base_url=...` (with `-P api_key_env=NAME`): any OpenAI-compatible endpoint
+1. `-P base_url=...` (with `-P api_key_env=NAME`): any supported compatible endpoint
 2. A known provider prefix with that provider's key set: the provider's own
-   endpoint, prefix stripped from the model id
+   endpoint, with the prefix stripped unless that endpoint requires the full id
 3. `OPENROUTER_API_KEY`: OpenRouter, any model string. Ids ending in a known
    OpenRouter variant suffix (`:free`, `:nitro`, `:floor`, `:extended`,
    `:online`, `:thinking`) always route here, since the variant means nothing
@@ -37,13 +37,50 @@ Providers resolved directly by prefix:
 
 | Prefix | Key | Endpoint |
 |---|---|---|
-| `anthropic/*` | `ANTHROPIC_API_KEY` | Anthropic (OpenAI-compat, or native with `-P wire=anthropic`) |
+| `anthropic/*` | `ANTHROPIC_API_KEY` | Anthropic (OpenAI-compat, or native with `-P wire=messages`) |
 | `openai/*` | `OPENAI_API_KEY` | OpenAI |
 | `google/*` | `GEMINI_API_KEY` | Google Gemini (OpenAI-compat) |
 | `x-ai/*` or `xai/*` | `XAI_API_KEY` | xAI |
 | `groq/*` | `GROQ_API_KEY` | Groq (rest of the id passed through, slashes and all) |
 | `mistralai/*` | `MISTRAL_API_KEY` | Mistral |
 | `deepseek/*` | `DEEPSEEK_API_KEY` | DeepSeek |
+| `thinkingmachines/*` | `TINKER_API_KEY` | Tinker Messages API (full model id passed through) |
+
+### Gemini Robotics ER 2
+
+Google serves two Gemini Robotics ER 2 model ids. Use
+`google/gemini-robotics-er-2-preview` on the default `chat` wire. The
+latency-oriented `google/gemini-robotics-er-2-streaming-preview` id requires
+the stateful Live API wire:
+
+```bash
+inspect-robots "pick up the cube" --policy agent \
+    -P model=google/gemini-robotics-er-2-streaming-preview \
+    -P wire=gemini-live --embodiment cubepick
+```
+
+The Live wire does not accept `effort` and does not use `image_horizon`.
+Leave both unset. Google's own Live context-window compression is the
+equivalent history mechanism because frames already streamed into a session
+cannot be evicted by the client. Live usage counts include the empty resumed
+generation and the observation-triggered generation on a normal step, so
+input token totals cover two generations per step.
+
+### Gemini Interactions API
+
+Use Google's stateful HTTP API for GA Gemini models that do not support the
+Live wire, including `gemini-3.7-flash`:
+
+```bash
+inspect-robots "pick up the cube" --policy agent \
+    -P model=google/gemini-3.7-flash -P wire=interactions \
+    -P effort=low --embodiment cubepick
+```
+
+The Interactions wire sends only each new observation and tool result while
+Google retains the conversation history behind an interaction id. Leave
+`image_horizon` unset because frames already absorbed by that server-side
+history cannot be evicted client-side.
 
 The wire format defaults to Chat Completions for broad OpenAI-compatible
 endpoint support:
@@ -52,7 +89,9 @@ endpoint support:
 |---|---|---|
 | `chat` (default) | `/chat/completions` | Anything OpenAI-compatible: OpenRouter, vLLM, Ollama, the Anthropic and Gemini compat endpoints |
 | `responses` | `/responses` | A direct OpenAI or compatible endpoint requires the Responses API |
-| `anthropic` | `/messages` | Driving Claude natively, which is what fast mode needs |
+| `messages` (`anthropic` alias) | `/messages` | Anthropic, Tinker, or a compatible Messages endpoint |
+| `gemini-live` | `BidiGenerateContent` (WSS) | Google's Live API: required for the `-streaming-` robotics model ids |
+| `interactions` | `/interactions` | Google's stateful HTTP API: server-side history for GA Gemini models, e.g. `gemini-3.7-flash` |
 
 ## How it works
 
@@ -74,8 +113,9 @@ user reads these notes live and in the saved transcript to follow what the
 agent sees and decides.
 
 Camera images are attached to every observation by default
-(`-P images=always`). Set `-P images=on_demand` to send state without image
-payloads and give the model a `take_pic` tool instead:
+(`-P images=always`), though `inspect-robots setup` suggests `on_demand`. Set
+`-P images=on_demand` to send state without image payloads and give the model a
+`take_pic` tool instead:
 
 ```bash
 inspect-robots "pick up the cube" --policy agent \
@@ -120,7 +160,16 @@ For displacement modes, `move_by` splits the requested total so every action
 fits the box side in that direction. The action box is the embodiment author's
 per-step speed statement, so `max_speed_frac` does not apply to displacement
 modes. `done` and `give_up` end the trial through the core's policy-stop
-channel.
+channel. Both tools ask for a required `hindsight` argument: what the agent
+knows now that it wishes it had known at the start of the episode, as
+concrete transferable rig and task facts. The system prompt announces the
+question up front so the model tracks learnings during the rollout. The
+answer persists twice deliberately (the transcript naturally carries the tool
+call as well): as `stop_hindsight` in the stop action's meta, and as
+`trial_metadata["hindsight"]` in the JSON log next to `llm_usage`. Missing
+hindsight never fails execution (the budget-exhausted forced `give_up`
+cannot answer). Harvested hindsight is written to be usable as
+`prior_learnings` input on later runs, which closes the relearning loop.
 
 When `control_hz` is `None`, the plugin uses a 10 Hz fallback to compute step
 counts and the per-call playout cap, but leaves the emitted chunk rate unset.
@@ -130,7 +179,10 @@ tool result does not report seconds.
 
 When the embodiment publishes operating notes via `EmbodimentInfo.docs`
 (joint layout, sign conventions, gripper polarity), the policy appends them
-to the system prompt as an `Embodiment notes:` section. The per-step
+to the system prompt as an `Embodiment notes:` section. When run under `eval()`,
+the policy receives the trial horizon via `bind_task()` and appends an
+`Environment step budget:` section to the system prompt, as well as tracking
+remaining environment steps in each observation. The per-step
 observation also labels the proprioceptive state vector with the action
 dimension names (`left_j0=0.01 ...`) whenever the mapping is unambiguous.
 
@@ -141,16 +193,167 @@ absolute interpolants. In displacement modes, a value tighter than the action
 box can truncate each `move_by` step. Either setting can make the executed
 motion fall short of the tool's requested total.
 
+### Operator feedback
+
+`LLMAgentPolicy` opts into the framework's live operator channel on attended
+runs. Feedback typed during a trial is included in the next observation sent
+to the model, labeled with the environment step when it was received. The
+model treats these lines as trusted guidance from the human supervising the
+robot. The framework also saves the feedback in the eval log.
+
+## Motion pre-check
+
+Python callers can pass `pre_check=` to `LLMAgentPolicy` to inspect one
+absolute motion before its chunk is emitted. The callable receives a
+read-only float64 array with shape `(steps, dim)`. It contains the exact
+already-clipped action waypoints for one move call. The first row is the first
+commanded waypoint and the last row is the final target. Return `None` to
+allow the motion. Return a nonempty human-readable string to reject it. The
+agent receives `pre-check rejected this motion: <reason>` and can choose a
+different target on the next turn.
+
+Here is an adapter for the collision checker from
+[`inspect-robots-yam`](https://github.com/robocurve/inspect-robots-yam):
+
+```python
+import numpy as np
+import numpy.typing as npt
+
+from inspect_robots_agent import LLMAgentPolicy
+from inspect_robots_yam.collision import CollisionChecker
+
+
+def make_yam_collision_pre_check(checker: CollisionChecker):
+    """Reject the first emitted YAM waypoint whose geometry penetrates."""
+
+    def check_yam_waypoints(
+        waypoints: npt.NDArray[np.float64],
+    ) -> str | None:
+        for index, waypoint in enumerate(waypoints):
+            report = checker.check(waypoint)
+            if report.collided:
+                return f"{report.geom1}:{report.geom2} at waypoint {index}"
+        return None
+
+    return check_yam_waypoints
+
+
+checker = CollisionChecker()
+policy = LLMAgentPolicy(pre_check=make_yam_collision_pre_check(checker))
+```
+
+This hook is programmatic-only. `-P` CLI flags carry serialized values and
+cannot carry callables. Displacement control modes are refused at bind time
+when a pre-check is configured because their emitted vectors are per-step
+deltas, not absolute configurations.
+
+**Layering:** The pre-check supplies model feedback. The framework approver
+chain remains the enforcement backstop. Passing the pre-check does not imply
+that an approver will pass the motion. In particular, the YAM collision
+approver sweeps interpolated substeps finer than the emitted waypoint spacing
+at low control rates. An adapter that needs parity should interpolate and
+check between emitted waypoints itself.
+
+**Exceptions:** Exceptions from the callable propagate. The rollout converts
+a generic exception into `PolicyError`, so the trial fails and
+`fail_on_error` applies. A typed `SafetyAbort` keeps its own meaning and halts
+the eval. A crashing or hard-vetoing adapter must fail visibly. Silently
+allowing the motion is never acceptable.
+
+**Retry budget:** A rejection is a normal tool error. Three rejected moves in
+a row raise a policy error instead of reaching `give_up`. Verify rig
+measurements such as `table_height` and base offsets so an over-conservative
+checker does not consume the budget.
+
+**Recorded identity:** Eval configuration records only the adapter code
+identity as `module.qualname`. Two runs using the same adapter with differently
+configured checkers record the same string. When checker configuration must
+be distinguishable, encode it in a named factory's qualname, for example
+`make_lab_a_table_742mm_pre_check`.
+
 > [!WARNING]
 > Guardrails are on by default at the CLI. **Never pass `--disable-guardrails`
 > on real hardware** unless you fully trust the policy and the rig.
 
 Configuration knobs (all `-P key=value`): `model`, `base_url`, `api_key_env`,
-`wire`, `speed`, `max_output_tokens`, `max_llm_calls` (default `100`),
+`wire`, `speed`, `service_tier`, `max_output_tokens`, `max_llm_calls` (default `100`),
+`max_retries` (default `3`, counting total attempts), `backoff_s` (default `1.0`),
 `temperature`, `effort`, `max_speed_frac`, `transcript_echo`, `images`
-(default `always`; use `on_demand` for model-requested frames).
-`speed` and `max_output_tokens` apply to `-P wire=anthropic` only, and passing
-either on another wire is an error rather than a silent no-op.
+(default `always`; use `on_demand` for model-requested frames; `inspect-robots setup` suggests `on_demand`),
+`image_horizon`, `depth` (default `render`; use `off` to omit depth
+renders), and `prior_learnings`.
+`speed` and `max_output_tokens` apply to `-P wire=messages` only, and passing
+either on another wire is an error. `speed=fast` is meaningful only for Claude
+on Anthropic's API; Tinker accepts and silently ignores it.
+
+Transient LLM failures use exponential backoff: `backoff_s * 2**attempt`.
+HTTP wires use a valid `Retry-After` header from the provider when one is
+present, including both seconds and HTTP-date values. Invalid headers fall
+back to exponential backoff. The Live wire has no HTTP response header, so it
+always uses the configured exponential delay. For example:
+
+```bash
+inspect-robots "pick up the cube" --policy agent \
+    -P model=google/gemini-3.7-flash -P max_retries=8 -P backoff_s=2.0 \
+    --embodiment cubepick
+```
+
+The effective retry settings are recorded in `EvalSpec.policy_config` so a
+run can be reproduced from its log.
+
+`service_tier` applies to `-P wire=responses` only. Accepted values are
+`auto`, `default`, `flex`, `priority`, `fast`, and `ultrafast`. Leave it unset (or pass
+`-P service_tier=none`) to omit the request field and retain the project's
+default. `default` explicitly requests standard processing. For OpenAI Fast
+mode, add these options to the existing task/embodiment command:
+
+```bash
+-P model=openai/gpt-6-astra -P wire=responses -P effort=medium -P service_tier=fast
+```
+
+OpenAI also accepts `priority` for Fast mode. This setting is independent of
+reasoning effort and robot speed. Model and project eligibility still apply,
+and Fast mode has a per-token premium; see the
+[OpenAI Fast mode guide](https://developers.openai.com/api/docs/guides/fast-mode).
+
+For GPT-6 Astra Ultrafast, set `OPENAI_API_KEY` and use
+`-P service_tier=ultrafast`. To test with the mock embodiment and no hardware:
+
+```bash
+inspect-robots "pick up the cube" --policy agent --embodiment cubepick \
+    -P model=openai/gpt-6-astra -P wire=responses -P effort=low \
+    -P service_tier=ultrafast
+```
+
+Ultrafast uses your API project's access and billing. See the
+[OpenAI Ultrafast mode guide](https://developers.openai.com/api/docs/guides/ultrafast-mode)
+for current availability, regional restrictions, and pricing.
+
+The requested tier is saved in `policy_config.service_tier`. Wire capture
+preserves the request and provider response, including the actual returned
+`service_tier`, which can differ from the requested tier.
+
+| Image option | Default | Behavior |
+|---|---|---|
+| `-P images=` | `always` | Attach every observation's frames; use `on_demand` for model-requested frames |
+| `-P image_horizon=` | `2` on the stateless HTTP wires; unset on `gemini-live` and `interactions` | Keep frames from the newest two image-bearing messages in each outgoing request; unset on `gemini-live` and `interactions` |
+
+On the stateless HTTP wires, set `-P image_horizon=none` to send the full image
+history. `image_horizon` is unset and rejects an explicit value on
+`gemini-live` and `interactions`.
+Do not use a bare `-P image_horizon=`: the CLI parses it as an empty string,
+which the policy rejects. Full history grows request bodies by about 420 KB
+per observation with three cameras and can reach a 413 response around 85
+observations. The HTTP default replaces older outgoing camera parts with
+deterministic text stubs; the saved conversation, transcript, and separately
+stored frames remain complete and unchanged.
+
+Set `-P prior_learnings=path/to/learnings.md` to append a nonempty UTF-8 notes
+file to the system prompt after any embodiment notes. The file is read once
+when the policy is constructed, and its resolved path and content hash are
+recorded in the eval configuration. The `hindsight` answers that `done` and
+`give_up` collect into `trial_metadata` are the natural source material for
+this file: harvest them across runs, distill, and feed them back here.
 Set `-P transcript_echo=true` to print live `[agent]` conversation lines to
 stderr, including goals, observation summaries, assistant output, tool calls,
 and tool results.
@@ -161,38 +364,148 @@ The speed fraction defaults to `0.1` and applies only to absolute modes.
 Camera labels such as `camera 'top_cam' (step 480):` provide the join key from a transcript observation to its stored frame.
 Live Rerun transcript streaming happens automatically when a Rerun sink is attached.
 
-Reasoning effort defaults to `low`: robot control is latency-sensitive (the
-arm stands still while the model thinks), safety guardrails sit below the
-model either way, and frontier models at low effort remain strong at this
-task shape. Raise it for hard manipulation problems (`-P effort=high`) or
-pass `-P effort=none` to omit the parameter for endpoints that reject it
-(the CLI reads a bare `none` as null). To send the literal wire value
-`none` and disable reasoning, quote it: `-P effort="'none'"`. GPT-5.x on
-chat completions requires the literal `none` when function tools are in
-play (any other value, or omitting the field, is a 400). In Python,
-`effort=None` omits the field and `effort="none"` sends the wire value.
+Wire capture is on by default (`-P wire_capture=false` to disable): every
+request attempt each wire client sends (tool schemas, evicted view, depth
+composites, and cache breakpoints) and every response land in
+`wire/<run_id>/<trial_id>/calls.jsonl` under the log directory, with image
+payloads deduplicated as `$blob:<sha256>` references into
+`wire/<run_id>/blobs/`. The format contract lives in the
+`inspect_robots_agent._capture` module docstring; browse captures with
+`inspect-robots view` (Wire section) or `inspect-robots inspect --wire`.
+Requires a core with the `on_trial_start` policy hook; on older cores the
+policy prints one notice and captures nothing.
+At trial end, `record.metadata["llm_usage"]` records `llm_calls` and the summed
+integer token counters returned by the wire. The Messages wire
+includes input, output, cache-creation, and cache-read tokens; other wires
+currently record `llm_calls` only. Trials with no LLM calls omit the key.
+
+Like `temperature`, reasoning effort is omitted when `-P effort=` is unset, so
+the provider's own default applies. Explicit named levels (`minimal`, `low`,
+`medium`, `high`, `xhigh`, and `max`) pass through unchanged. A bare
+`-P effort=none` now requests the true minimum on the stateless HTTP wires:
+
+| Wire | Request field |
+| --- | --- |
+| `chat` | `reasoning_effort: "none"` |
+| `responses` | `reasoning: {"effort": "none"}` |
+| `messages` | `thinking: {"type": "disabled"}` (no `output_config`) |
+
+On `wire=interactions`, `minimal`, `low`, `medium`, and `high` map to
+`generation_config.thinking_level`. Other named levels, `none`, and fractional
+effort are rejected because the accepted thinking levels are model-specific.
+
+The older quoted spelling, `-P effort="'none'"`, remains valid but is no longer
+needed. In Python, both `effort=None` and `effort="none"` request the `none`
+level; omit the argument to inherit the provider default. Gemini Live has no
+effort field and rejects any explicit effort, so leave it unset on that wire.
+To pin the behavior from before version 0.23, add `-P effort=low`.
+
+Effort also takes a number in `[0.0, 1.0)` for servers that read it as a
+fraction instead of a named level (`-P effort=0.7`). The number is sent
+unquantized, so an effort sweep keeps whatever resolution the server offers.
+Named levels stay the portable choice: every wire and provider accepts some of
+them, while fractional effort is accepted today only by Tinker's
+OpenAI-compatible endpoint (see below). A server that takes levels only rejects
+a fraction with a guided 4xx naming the wire that does accept one.
+
+## Depth rendering
+
+For each camera, the policy looks for metric depth in
+`observation.extra[f"{cam}_depth"]`. When present, it renders the depth as a
+grayscale image immediately after that camera's RGB image: near is bright,
+far is dim, and invalid pixels are black. Depth follows RGB in both
+`images=always` observations and `take_pic` reveals under
+`images=on_demand`.
+
+Each render is preceded by a metric label:
+
+```text
+depth 'left_cam' (step 3): bright 0.09 m -> dim 1.41 m (2nd-98th pctl), 87% valid, center 0.31 m:
+```
+
+The bright and dim distances anchor the grayscale window at the 2nd and 98th
+percentiles of valid depth. The valid percentage is an integer, and the
+center depth appears only when the center pixel is valid. As with RGB camera
+labels, the `(step N)` suffix is present only when the observation carries an
+integer environment step; otherwise the label starts
+`depth 'left_cam': bright ...`.
+
+Depth rendering defaults to `-P depth=render`. Set `-P depth=off` to restore
+RGB-only observation payloads. Each rendered depth camera adds another image
+to an observation or reveal, so this kill-switch is useful when input payload
+cost matters.
+
+A camera with no `{cam}_depth` key is unchanged. If a depth thunk fails, its
+value is non-numeric or not two-dimensional, or fewer than 1% of its pixels
+are valid, the policy emits a descriptive text line and no depth image.
+
+Saved transcripts retain the metric depth label but replace the depth image
+with the standard `[image omitted: streamed camera frame]` placeholder. The
+HTML viewer shows that placeholder text verbatim below the depth label because
+the frame store has no saved frame for rendered depth. This is a known
+cosmetic artifact; the metric label remains available in the report.
+
+## Inkling on Tinker
+
+Tinker serves Inkling and Inkling-Small directly through the Messages API.
+Set its key and select the model; the provider prefix infers the wire and keeps
+the full model id required by the endpoint:
+
+```bash
+export TINKER_API_KEY=tk-...
+
+inspect-robots "pick up the cube" --policy agent \
+    -P model=thinkingmachines/Inkling -P effort=low \
+    --embodiment cubepick
+```
+
+With effort unset, Inkling inherits Tinker's own default, documented as high in
+the thinking-effort cookbook. That can increase control latency because the arm
+stands still while the model thinks; pass `-P effort=low` for latency-sensitive
+runs or to pin the plugin's pre-0.23 behavior. The endpoint accepts `low`,
+`medium`, `high`, `xhigh`, and `max`; `minimal` is unsupported. `effort=none`
+is sent as disabled thinking, which Tinker's endpoint has not been observed to
+accept — expect a wire rejection until confirmed otherwise.
+
+Fractional effort is a Tinker feature, but only on its OpenAI-compatible
+endpoint, which reads `reasoning_effort` as a number from `0.0` to `0.99`
+(`0.995` and above are a 422). The Messages endpoint that serves Inkling here
+takes named levels only, so `-P effort=0.7` needs
+`-P wire=chat -P base_url=` pointed at `.../tinker-prod/oai/api/v1`. That
+endpoint silently ignores `tools`, so it cannot currently drive a robot episode:
+the policy sees no tool call and fails after three turns. Treat fractional
+effort on Tinker as usable for prompt-level experiments, and named levels as the
+setting for real rollouts until the Messages endpoint accepts a number.
+
+Tinker currently reports `input_tokens: 0` because input usage appears in its
+cache-creation and cache-read counters. EvalLog input-token statistics and the
+live `in=0` transcript line therefore undercount input even though requests are
+processed normally. Tinker is a beta service. `-P speed=fast` is a
+Claude-on-Anthropic-API option and Tinker silently ignores it, returning HTTP
+200 at normal speed. Extended-context model ids ending in `:peft:262144` have
+not been tested with this plugin.
 
 ## Fast mode on Claude
 
-`-P wire=anthropic` drives Claude through the native Messages API instead of
+`-P wire=messages` drives Claude through the native Messages API instead of
 the OpenAI-compat endpoint. That is the only way to reach fast mode, which
 serves the same model at up to 2.5x higher output tokens per second:
 
 ```bash
 inspect-robots "pick up the cube" --policy agent \
-    -P model=anthropic/claude-opus-5 -P wire=anthropic -P speed=fast \
+    -P model=anthropic/claude-opus-5 -P wire=messages -P speed=fast \
     --embodiment cubepick
 ```
 
-The model id keeps the `anthropic/` prefix on this wire, the same as every
-other model string here. Only Anthropic's own endpoint serves `/v1/messages`,
-so anything that resolves elsewhere is refused up front with the fix named: a
-bare `-P model=claude-opus-5`, another provider's prefix such as `openai/`, or
-an OpenRouter `:variant` suffix. Pass `-P base_url=...` to point at a gateway
-that serves the endpoint yourself.
+Direct-provider model-id handling follows the provider table: Anthropic takes
+the bare Claude id, while Tinker keeps `thinkingmachines/`. A Messages run is
+refused up front when its model resolves to an endpoint that does not serve
+`/v1/messages`, with a fix for a missing prefix, provider key, or an OpenRouter
+`:variant` suffix. Pass `-P base_url=...` to point at a compatible Messages
+gateway yourself.
 
 > [!NOTE]
-> With `-P base_url=...` and no `-P api_key_env=`, this wire sends
+> With `-P base_url=...` and no `-P api_key_env=`, the Messages wire sends
 > `$ANTHROPIC_API_KEY` to that host. The other wires default to
 > `$OPENROUTER_API_KEY` instead. Name the variable explicitly
 > (`-P api_key_env=MYGW_KEY`) when the gateway takes its own credential, and
@@ -205,16 +518,68 @@ while standard quota sits idle. It is available on Claude Opus 5 and Opus 4.8,
 on the Claude API only: not Bedrock, Vertex, Foundry, or Claude Platform on
 AWS. A rejection that names fast mode is turned into an error naming the fix.
 
-This wire always requests adaptive thinking, which pre-4.6 models such as
-Sonnet 4.5 and Haiku 4.5 do not support. Use `-P wire=chat` for those.
+With effort unset or set to a named level, this wire requests adaptive
+thinking. Pre-4.6 models such as Sonnet 4.5 and Haiku 4.5 do not support
+adaptive thinking; pass `-P effort=none` to disable thinking and use them on
+`wire=messages`, or use `-P wire=chat`.
 
 The Messages API requires an output cap, so `-P max_output_tokens=` defaults to
 `16000` here. Thinking bills against that same cap, and a response truncated at
 the limit is an error naming the knob rather than a silently missing tool call.
-Keep `-P effort=` at `high` or below on this wire: `xhigh` and `max` want a cap
-of 64000 or more, which needs streaming this client does not implement yet.
+On Anthropic's endpoint, keep `-P effort=` at `high` or below: `xhigh` and
+`max` want a cap of 64000 or more, which needs streaming this client does not
+implement yet. Tinker accepts `xhigh` and `max` with the plugin's non-streaming
+request shape.
 The read timeout scales with the cap and tops out at 600 s per attempt, so a
 large cap plus retries can sit for several minutes before failing.
+
+Prompt caching is automatic on this wire. Requests use up to three ephemeral
+breakpoints: the system prompt, the newest elided-image anchor when one exists,
+and the final message. Check
+`record.metadata["llm_usage"]["cache_read_input_tokens"]` to verify cache hits;
+it should become positive after the first ordinary call.
+Anthropic searches only 20 blocks behind a breakpoint, so a cycle with heavy
+retry or on-demand rejection churn can cause one silent full-prefix rewrite
+and a temporary zero cache-read count. A final nudge also changes wire shape
+once it is superseded. Both are cost blips rather than errors, and the anchor
+normally restores the hit on the next cycle.
+
+## Prompt caching on the Responses wire
+
+For GPT-5.6 and GPT-6 model families, `wire=responses` uses explicit-only
+caching (`prompt_cache_options.mode=explicit`, `ttl=30m`). The harness marks
+initial system/developer instructions, the newest elided-image message,
+and the current tail with `prompt_cache_breakpoint`. Image-ending content uses
+an empty `input_text` block after the final image as the marker location;
+tool-result tails are marked on the final result. The empty block stays in
+translated history even when unmarked, preserving earlier reusable prefixes.
+Original text, images, and their ordering remain unchanged.
+Unsupported tail items are left unmarked, preserving raw assistant and
+reasoning replay. Other model IDs retain the existing request format.
+
+Responses also marks the longest unchanged historical prefix selected on a
+successful request. This supplies an explicit lookup endpoint where the
+Messages wire relies on Anthropic's backward lookup. Coincident endpoints
+are deduplicated; each request has at most four markers. Fingerprints cover
+the full translated prefix and request settings. Failed or incomplete calls
+do not add candidates, and trial reset clears local tracking. A candidate
+means the prefix was submitted, not that the provider cached it.
+
+Messages behavior and the image horizon are unchanged. This matches intended
+reuse, not provider hit rates: retention, cache availability, and minimum
+lengths differ. Responses does not emulate Anthropic's 20-block lookback using
+OpenAI blocks. Image removal invalidates the changed prefix and every later
+endpoint; an earlier unchanged prefix can still be reused.
+
+Check `usage.input_tokens_details.cached_tokens` and `cache_write_tokens`
+in captured Responses payloads to measure reuse. See OpenAI's
+[prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+for the boundary and retention semantics.
+
+OpenRouter strips `prompt_cache_breakpoint` from `input_image` blocks. The
+empty text anchor preserves the boundary after the complete image without
+adding prompt text. Live Astra validation through that route on 2026-09-23
+confirmed that this representation writes and reuses the image-ending prefix.
 
 ## Reasoning effort on OpenAI models
 
@@ -234,3 +599,7 @@ inspect-robots "pick up the cube" --policy agent \
     -P model=openai/gpt-5.6-sol -P wire=responses -P effort=medium \
     --embodiment cubepick
 ```
+
+To stay on Chat Completions and disable reasoning instead, pass
+`-P effort=none`. It sends the literal `reasoning_effort: "none"`; no nested
+quoting is required.

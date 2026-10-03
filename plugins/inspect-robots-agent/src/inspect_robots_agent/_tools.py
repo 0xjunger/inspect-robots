@@ -2,8 +2,8 @@
 
 Tools are generated from the embodiment's spaces, so the plugin never needs
 embodiment-specific motion knowledge. Absolute targets are interpolated with a
-per-step limit of ``min(max_speed_frac / hz, 0.05)`` times each dimension's
-range. Displacements are split by the available box side, which the plugin
+declared per-dimension limit where available and a range-derived backstop
+otherwise. Displacements are split by the available box side, which the plugin
 treats as the embodiment author's per-action limit.
 
 Tool mistakes come back as structured error strings the LLM can correct.
@@ -15,16 +15,21 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
-from inspect_robots.spaces import CANONICAL_STATE_UNITS, Box, ObservationSpace
+from inspect_robots.spaces import (
+    ABSOLUTE_CONTROL_MODES,
+    CANONICAL_STATE_UNITS,
+    Box,
+    ObservationSpace,
+)
 from inspect_robots.types import Action, ActionChunk, Observation
 
-_ABSOLUTE_MODES = frozenset({"joint_pos", "eef_abs_pose"})
 _DISPLACEMENT_MODES = frozenset({"eef_delta_pos", "eef_delta_pose", "joint_delta"})
 _POSE_MODES = frozenset({"eef_abs_pose", "eef_delta_pose"})
 _SAFE_ROT = frozenset({"none", "rot6d"})
@@ -32,7 +37,23 @@ _SAFE_ROT = frozenset({"none", "rot6d"})
 _FALLBACK_HZ = 10.0
 _MAX_DURATION_S = 10.0
 _BACKSTOP_STEP_FRAC = 0.05
+_DEFAULT_SPEED_FRAC = 0.1
 _RELATIVE_HEADROOM = 1e-6
+_HINDSIGHT_DESCRIPTION = (
+    "What do you know now that you wish you had known at the start of this episode? "
+    "Concrete, transferable facts about this rig, task, or embodiment (camera mounting "
+    "and extrinsics, table and base geometry, gripper axis and offsets, controller "
+    "behavior, metric scale), written as advice to a future agent attempting the same "
+    "task. Say 'none' if nothing qualifies."
+)
+
+#: A motion hook over the exact clipped absolute waypoints for one move call.
+#:
+#: The input is a read-only stacked float64 copy with shape ``(steps, dim)``.
+#: Its first row is the first commanded waypoint and its last row is the final
+#: target. Return ``None`` to allow the motion or a non-empty reason to reject
+#: it. Exceptions propagate unchanged.
+PreCheck = Callable[[npt.NDArray[np.float64]], str | None]
 
 
 class ToolsetError(Exception):
@@ -77,6 +98,7 @@ class Toolset:
         pose: bool = False,
         images: str = "always",
         cameras: tuple[str, ...] = (),
+        pre_check: PreCheck | None = None,
     ):
         self._absolute = absolute
         self._pose = pose
@@ -99,6 +121,7 @@ class Toolset:
         self._step_limits = step_limits
         self._images = images
         self._cameras = cameras
+        self._pre_check = pre_check
         if absolute:
             self._positive_limits = np.zeros_like(high)
             self._negative_limits = np.zeros_like(low)
@@ -181,8 +204,14 @@ class Toolset:
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"summary": {"type": "string"}},
-                    "required": ["summary"],
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "hindsight": {
+                            "type": "string",
+                            "description": _HINDSIGHT_DESCRIPTION,
+                        },
+                    },
+                    "required": ["summary", "hindsight"],
                 },
             },
         }
@@ -193,8 +222,14 @@ class Toolset:
                 "description": "Stop trying; the task cannot be completed. The trial ends.",
                 "parameters": {
                     "type": "object",
-                    "properties": {"reason": {"type": "string"}},
-                    "required": ["reason"],
+                    "properties": {
+                        "reason": {"type": "string"},
+                        "hindsight": {
+                            "type": "string",
+                            "description": _HINDSIGHT_DESCRIPTION,
+                        },
+                    },
+                    "required": ["reason", "hindsight"],
                 },
             },
         }
@@ -291,9 +326,15 @@ class Toolset:
     def _stop(self, name: str, arguments: dict[str, Any], observation: Observation) -> ToolResult:
         data = self._current_state(observation)
         detail = str(arguments.get("summary") or arguments.get("reason") or "")
+        meta = {"request_stop": True, "stop_reason": name, "stop_detail": detail}
+        hindsight = arguments.get("hindsight")
+        # The schema's "say 'none'" escape hatch must not pollute harvested
+        # metadata with literal sentinels.
+        if isinstance(hindsight, str) and hindsight.strip() and hindsight.strip().lower() != "none":
+            meta["stop_hindsight"] = hindsight.strip()
         action = Action(
             data=data,
-            meta={"request_stop": True, "stop_reason": name, "stop_detail": detail},
+            meta=meta,
         )
         return ToolResult(
             chunk=ActionChunk(actions=[action], control_hz=self._hz),
@@ -402,14 +443,14 @@ class Toolset:
                 )
             target[index] = value
 
-        ratios: list[np.float64] = []
+        ratios: list[float] = []
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             for index in named_indices:
                 distance = np.abs(np.subtract(target[index], current[index]))
                 limit = self._step_limits[index]
                 if distance > 0 and limit > 0:
-                    ratios.append(np.divide(distance, limit))
-            ratio = max(ratios, default=np.float64(0.0))
+                    ratios.append(float(np.divide(distance, limit)))
+            ratio = max(ratios, default=0.0)
             headed_ratio = np.divide(ratio, 1.0 - _RELATIVE_HEADROOM)
         if headed_ratio > self._max_steps:
             return self._cap_error()
@@ -422,6 +463,14 @@ class Toolset:
         ]
         actions[-1] = Action(data=np.clip(target.copy(), self._low, self._high))
         clipped_target = np.clip(target.copy(), self._low, self._high)
+        if self._pre_check is not None:
+            waypoints: npt.NDArray[np.float64] = np.asarray(
+                np.stack([action.data for action in actions]),
+                dtype=np.float64,
+            )
+            waypoints.flags.writeable = False
+            if message := self._pre_check(waypoints):
+                return ToolResult(error="pre-check rejected this motion: " + message)
         return self._success(actions, steps, target=clipped_target)
 
     def _move_displacement(
@@ -429,7 +478,7 @@ class Toolset:
         vector: npt.NDArray[np.float64],
         named_indices: list[int],
     ) -> ToolResult:
-        ratios: list[np.float64] = []
+        ratios: list[float] = []
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             for index in named_indices:
                 value = vector[index]
@@ -440,8 +489,8 @@ class Toolset:
                     return ToolResult(
                         error=f"dimension {self._labels[index]} cannot move in that direction"
                     )
-                ratios.append(np.divide(np.abs(value), limit))
-            ratio = max(ratios, default=np.float64(0.0))
+                ratios.append(float(np.divide(np.abs(value), limit)))
+            ratio = max(ratios, default=0.0)
             headed_ratio = np.divide(ratio, 1.0 - _RELATIVE_HEADROOM)
         if headed_ratio > self._max_steps:
             return self._cap_error()
@@ -475,6 +524,9 @@ class Toolset:
         *,
         target: npt.NDArray[np.float64] | None = None,
     ) -> ToolResult:
+        if actions:
+            last = actions[-1]
+            actions[-1] = Action(data=last.data, meta={**last.meta, "chunk_final": True})
         note = f"executing {self._move_tool} over {steps} steps"
         if self._hz is not None:
             note += f" ({steps / self._hz:.1f}s)"
@@ -491,6 +543,7 @@ def build_toolset(
     control_hz: float | None,
     max_speed_frac: float = 0.1,
     images: str = "always",
+    pre_check: PreCheck | None = None,
 ) -> Toolset:
     """Validate an embodiment's spaces and build its agent-facing tools.
 
@@ -514,8 +567,14 @@ def build_toolset(
             f"rotation_repr {semantics.rotation_repr!r} cannot be driven per-dimension; "
             f"only {sorted(_SAFE_ROT)} are supported"
         )
-    if mode not in _ABSOLUTE_MODES | _DISPLACEMENT_MODES:
+    if mode not in ABSOLUTE_CONTROL_MODES | _DISPLACEMENT_MODES:
         raise ToolsetError(f"control_mode {mode!r} is not supported by the agent policy yet")
+    if pre_check is not None and mode in _DISPLACEMENT_MODES:
+        raise ToolsetError(
+            "pre_check cannot be used with displacement control modes: they emit "
+            "per-step delta vectors that a configuration checker would misread "
+            "(plan 0031)"
+        )
     if control_hz is not None and (not np.isfinite(control_hz) or control_hz <= 0):
         raise ToolsetError("control_hz must be finite and > 0 when declared")
     if not np.isfinite(max_speed_frac) or max_speed_frac <= 0:
@@ -523,7 +582,7 @@ def build_toolset(
     resolved_hz = control_hz if control_hz is not None else _FALLBACK_HZ
     if not math.isfinite(_MAX_DURATION_S * resolved_hz):
         raise ToolsetError(f"control_hz {control_hz!r} is too large to derive a playout cap")
-    if max_speed_frac / resolved_hz == 0.0:
+    if mode in _DISPLACEMENT_MODES and max_speed_frac / resolved_hz == 0.0:
         raise ToolsetError(
             f"max_speed_frac {max_speed_frac!r} underflows to a zero per-step "
             f"limit at control_hz {resolved_hz!r}"
@@ -533,7 +592,7 @@ def build_toolset(
             f"only 1-D (vector) action spaces are supported, got shape {action_space.shape}"
         )
 
-    absolute = mode in _ABSOLUTE_MODES
+    absolute = mode in ABSOLUTE_CONTROL_MODES
     dim = action_space.dim
     state_key: str | None = None
     state_spec = observation_space.state
@@ -544,6 +603,18 @@ def build_toolset(
                 "observation space to locate the proprioceptive reference"
             )
         matching = [field.key for field in state_spec.fields if field.shape == (dim,)]
+        if len(matching) > 1:
+            # An embodiment may expose several same-shaped state fields — e.g.
+            # a 14-D joint_pos next to a 14-D Cartesian eef_state. Prefer the
+            # field whose key prefix matches the control mode's family before
+            # declaring the shape ambiguous. Every ABSOLUTE_CONTROL_MODES
+            # member today is eef_* or joint_*; a future mode outside both
+            # families falls back to "joint" and, absent a joint_* field,
+            # still reaches the ambiguity error below.
+            family = "eef" if mode.startswith("eef") else "joint"
+            preferred = [key for key in matching if key.startswith(family)]
+            if len(preferred) == 1:
+                matching = preferred
         if len(matching) != 1:
             raise ToolsetError(
                 f"absolute-target control needs exactly one state field with shape "
@@ -570,19 +641,27 @@ def build_toolset(
         raise ToolsetError("action-space range (high - low) overflows; bounds are too large")
     if not absolute and (bool(np.any(low64 > 0)) or bool(np.any(high64 < 0))):
         raise ToolsetError("displacement control bounds must contain zero in every dimension")
-    # DeltaLimitApprover derives its default limit in the box's native dtype;
-    # reproduce that arithmetic exactly so our ceiling can never exceed it.
+    # DeltaLimitApprover derives undeclared dimensions in the box's native
+    # dtype; reproduce that arithmetic exactly before substituting declarations.
     native_backstop = np.asarray(_BACKSTOP_STEP_FRAC * (high - low), dtype=np.float64)
     step_limits = np.zeros_like(high64)
     if absolute:
+        declared = semantics.max_step or (None,) * dim
+        declared_mask = np.fromiter(
+            (entry is not None for entry in declared), dtype=np.bool_, count=dim
+        )
+        effective_budget = native_backstop.copy()
+        for index, entry in enumerate(declared):
+            if entry is not None:
+                effective_budget[index] = entry
         # Interpolants snap to the float grid at the bounds' magnitude. If that
-        # grid is coarse relative to the backstop (offset boxes like
-        # [1e16, 1e16 + 2], or ranges whose 5% underflows to zero), emitted
-        # steps jump by more than the backstop allows and motions silently
+        # grid is coarse relative to the effective per-dimension budget (offset
+        # boxes like [1e16, 1e16 + 2], or ranges whose 5% underflows to zero),
+        # emitted steps jump by more than the budget allows and motions silently
         # truncate — the exact failure this plugin exists to remove.
         spacing = np.spacing(np.maximum(np.abs(low64), np.abs(high64)))
         movable = high64 > low64
-        if bool(np.any(movable & (spacing > 5e-7 * native_backstop))):
+        if bool(np.any(movable & (spacing > 5e-7 * effective_budget))):
             raise ToolsetError(
                 "bounds are too coarse at this magnitude for speed-limited "
                 "interpolation (float spacing exceeds the per-step budget)"
@@ -590,9 +669,11 @@ def build_toolset(
         resolved = control_hz if control_hz is not None else _FALLBACK_HZ
         step_frac = min(max_speed_frac / resolved, _BACKSTOP_STEP_FRAC)
         step_limits = np.minimum(step_frac * (high64 - low64), native_backstop)
+        declared_scale = min(max_speed_frac / _DEFAULT_SPEED_FRAC, 1.0)
+        step_limits[declared_mask] = effective_budget[declared_mask] * declared_scale
         # The frac/hz quotient can be nonzero yet still underflow to a zero
-        # limit once multiplied by a small range; a movable dimension with a
-        # zero limit would be misreported as fixed.
+        # limit once multiplied by a small range or declared max_step; a
+        # movable dimension with a zero limit would be misreported as fixed.
         if bool(np.any(movable & (step_limits == 0))):
             raise ToolsetError(
                 f"max_speed_frac {max_speed_frac!r} underflows the derived "
@@ -632,4 +713,5 @@ def build_toolset(
         pose=mode in _POSE_MODES,
         images=images,
         cameras=tuple(camera.name for camera in observation_space.cameras),
+        pre_check=pre_check,
     )

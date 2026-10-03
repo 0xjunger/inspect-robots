@@ -11,13 +11,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  issue-bot:
+    name: Issue bot tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tools/issue-bot/package-lock.json
+      - run: npm ci
+        working-directory: tools/issue-bot
+      - run: npm run types && npm run check
+        working-directory: tools/issue-bot
+      - name: Runner artifact and Linux isolation tests
+        run: sudo python3 -m unittest discover -s tools/issue-bot/sandbox -p 'test_*.py'
+
   # Lint + strict typing, once, on a single interpreter. (mypy targets the 3.10
   # floor via pyproject; running it on 3.11 avoids NumPy's 3.12-only stub syntax.)
   quality:
     name: lint · type
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0  # hatch-vcs needs full history/tags for versioning
       - name: Install uv
@@ -41,7 +60,7 @@ jobs:
     name: docs build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0  # hatch-vcs needs full history/tags for versioning
       - name: Install uv
@@ -80,7 +99,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -103,7 +122,7 @@ jobs:
     name: test (rerun extra)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -137,7 +156,7 @@ jobs:
             python-version: "3.12"
             numpy: "numpy>=2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -160,7 +179,7 @@ jobs:
     name: core-only import (no rerun/torch)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -191,7 +210,7 @@ jobs:
     name: plugin · isaacsim (no Isaac)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -230,7 +249,7 @@ jobs:
     name: plugin · xpolicylab
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -259,13 +278,49 @@ jobs:
           uv run --no-sync python -m pytest plugins/inspect-robots-xpolicylab/tests -q
           --cov=inspect_robots_xpolicylab --cov-report=term-missing --cov-fail-under=0
 
+  # The voice plugin's suite needs no microphone or model download: injected
+  # fakes cover device selection, segmentation, transcription filtering,
+  # threading, backpressure, and trial-generation races offline.
+  plugin-voice:
+    name: plugin · voice
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Sync workspace (core + plugins, dev extras)
+        run: uv sync --locked --python 3.11 --all-packages --extra dev
+      - name: Ruff (plugin, lint)
+        run: uv run --no-sync ruff check plugins/inspect-robots-voice
+      - name: Ruff (plugin, format check)
+        run: uv run --no-sync ruff format --check plugins/inspect-robots-voice
+      - name: Mypy (plugin, strict)
+        run: >
+          uv run --no-sync mypy
+          --config-file plugins/inspect-robots-voice/pyproject.toml
+          plugins/inspect-robots-voice/src/inspect_robots_voice
+          plugins/inspect-robots-voice/tests
+      - name: Pytest (plugin, with coverage)
+        # Report-only, like the other plugin jobs. Tests exercise the real
+        # orchestration through fakes without importing audio/model runtimes.
+        run: >
+          uv run --no-sync python -m pytest plugins/inspect-robots-voice/tests -q
+          --cov=inspect_robots_voice --cov-report=term-missing --cov-fail-under=0
+
   # The ROS adapter's suite needs no ROS install or robot: an in-process
   # rosbridge stub covers protocol shapes, threading, pacing, reset, and spaces.
   plugin-ros:
     name: plugin · ros
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -301,7 +356,7 @@ jobs:
     name: plugin · agent
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -337,7 +392,7 @@ jobs:
     name: plugin · capx
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install uv
@@ -366,12 +421,45 @@ jobs:
           uv run --no-sync python -m pytest plugins/inspect-robots-capx/tests -q
           --cov=inspect_robots_capx --cov-report=term-missing --cov-fail-under=0
 
+  # Guard against the #208/#212 accident class: eval outputs (or any large
+  # blob) swept into a commit by git add -A. Per-file pre-commit hooks are
+  # local-only and GitHub's own limit is 100 MB per file, so 3 GB of small
+  # files sailed through every gate. This is the server-side backstop.
+  repo-hygiene:
+    name: repo hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: No tracked files under logs/
+        run: |
+          tracked=$(git ls-files logs/)
+          if [ -n "$tracked" ]; then
+            echo "::error::eval outputs must never be committed (see #212):"
+            echo "$tracked" | head -20
+            exit 1
+          fi
+      - name: No tracked file over 5 MB
+        run: |
+          # Filenames are PR-author-controlled: keep them out of shell parsing
+          # (no xargs/sh -c substitution), always quoted.
+          oversize=""
+          while IFS= read -r -d '' f; do
+            if [ "$(wc -c < "$f")" -gt 5242880 ]; then
+              oversize="$oversize$f"$'\n'
+            fi
+          done < <(git ls-files -z)
+          if [ -n "$oversize" ]; then
+            echo "::error::files over 5 MB do not belong in this repo; use a release asset or external storage:"
+            printf '%s' "$oversize"
+            exit 1
+          fi
+
   # Single required status check for branch protection: green iff every job
   # above is green. Add new jobs to 'needs' here or they won't gate merges.
   ci-ok:
     name: ci-ok
     if: ${{ always() }}
-    needs: [quality, docs-build, test, test-rerun, test-extra, core-only-import, plugin-isaacsim, plugin-xpolicylab, plugin-ros, plugin-agent, plugin-capx]
+    needs: [issue-bot, quality, docs-build, test, test-rerun, test-extra, core-only-import, plugin-isaacsim, plugin-xpolicylab, plugin-voice, plugin-ros, plugin-agent, plugin-capx, repo-hygiene]
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every needed job succeeded
@@ -384,7 +472,7 @@ jobs:
   alert-red-main:
     name: alert on red main
     if: ${{ failure() && github.event_name == 'push' }}
-    needs: [quality, docs-build, test, test-rerun, test-extra, core-only-import, plugin-isaacsim, plugin-xpolicylab, plugin-ros, plugin-agent, plugin-capx]
+    needs: [quality, docs-build, test, test-rerun, test-extra, core-only-import, plugin-isaacsim, plugin-xpolicylab, plugin-voice, plugin-ros, plugin-agent, plugin-capx]
     runs-on: ubuntu-latest
     permissions:
       issues: write

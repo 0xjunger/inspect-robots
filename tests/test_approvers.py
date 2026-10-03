@@ -8,10 +8,18 @@ bounds, or unaverageable rotation reps refuse loudly.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
-from inspect_robots.approver import ChainApprover, ClampApprover, DeltaLimitApprover
+from inspect_robots.approver import (
+    AutoApprover,
+    ChainApprover,
+    ClampApprover,
+    DeltaLimitApprover,
+    GuardrailContribution,
+)
 from inspect_robots.errors import SafetyAbort
 from inspect_robots.spaces import ActionSemantics, Box, RotationRepr
 from inspect_robots.types import Action
@@ -61,8 +69,9 @@ def test_refuses_absolute_pose_mode_with_unaverageable_rotation() -> None:
 def test_delta_pose_rotation_deltas_clamp_per_dim(rotation_repr: RotationRepr) -> None:
     # eef_delta_pose carries small rotation *deltas*, not absolute orientations.
     # euler_xyz/axis_angle deltas have a zero-vector no-op, so they clamp per
-    # dimension like a bounded displacement (#143). Quaternion deltas are the
-    # exception — see test_refuses_displacement_pose_mode_with_quat_rotation.
+    # dimension like a bounded displacement (#143). Quaternion and rot6d
+    # deltas are the exception — see
+    # test_refuses_displacement_pose_mode_with_off_origin_rotation.
     # BridgeData V2 shape: 3 xyz + 3 euler deltas + 1 gripper.
     space = Box(
         shape=(7,),
@@ -77,17 +86,24 @@ def test_delta_pose_rotation_deltas_clamp_per_dim(rotation_repr: RotationRepr) -
     assert out.meta.get("delta_clamped") is True
 
 
-@pytest.mark.parametrize("rotation_repr", ["quat_wxyz", "quat_xyzw"])
-def test_refuses_displacement_pose_mode_with_quat_rotation(rotation_repr: RotationRepr) -> None:
-    # A quaternion delta's identity is (1, 0, 0, 0), not the zero vector:
-    # clamping it per dimension toward a symmetric ±max_delta box drags it away
-    # from identity, and downstream re-normalization can amplify the rotation
-    # instead of limiting it — same failure class as an absolute quat.
-    # 3 xyz + 4 quat + 1 gripper = 8 dims.
+@pytest.mark.parametrize(
+    ("rotation_repr", "rot_dim"),
+    [("quat_wxyz", 4), ("quat_xyzw", 4), ("rot6d", 6)],
+)
+def test_refuses_displacement_pose_mode_with_off_origin_rotation(
+    rotation_repr: RotationRepr, rot_dim: int
+) -> None:
+    # These reps' identity/no-op is not the zero vector (quaternion identity is
+    # (1, 0, 0, 0); rot6d identity is (1, 0, 0, 0, 1, 0)): clamping a delta per
+    # dimension toward a symmetric ±max_delta box drags it away from identity,
+    # and downstream re-normalization can amplify the rotation instead of
+    # limiting it — same failure class as clamping an absolute quat (#150).
+    # 3 xyz + rot_dim + 1 gripper.
+    dim = 3 + rot_dim + 1
     space = Box(
-        shape=(8,),
-        low=np.full(8, -1.0),
-        high=np.full(8, 1.0),
+        shape=(dim,),
+        low=np.full(dim, -1.0),
+        high=np.full(dim, 1.0),
         semantics=ActionSemantics("eef_delta_pose", rotation_repr=rotation_repr),
     )
     with pytest.raises(ValueError, match="rotation_repr"):
@@ -148,12 +164,174 @@ def test_absolute_reference_is_the_approved_action_not_the_request() -> None:
     assert np.allclose(out.data, [0.2, 0.0])  # walks, one clamped step at a time
 
 
+def test_rewind_reference_changes_an_existing_reference() -> None:
+    approver = DeltaLimitApprover(_abs_space(), max_delta=0.1)
+    store: dict[str, object] = {}
+    approver.review(Action(data=np.array([0.0, 0.0])), store)
+
+    DeltaLimitApprover.rewind_reference(store, np.array([0.5, 0.5]))
+    out = approver.review(Action(data=np.array([0.8, 0.8])), store)
+
+    assert np.allclose(out.data, [0.6, 0.6])
+
+
+def test_rewind_reference_is_a_noop_without_a_limiter_reference() -> None:
+    store: dict[str, object] = {"other": np.array([0.0, 0.0])}
+
+    DeltaLimitApprover.rewind_reference(store, np.array([0.5, 0.5]))
+
+    assert set(store) == {"other"}
+
+
+def test_rewind_reference_stores_a_copy() -> None:
+    approver = DeltaLimitApprover(_abs_space(), max_delta=0.1)
+    store: dict[str, object] = {}
+    approver.review(Action(data=np.array([0.0, 0.0])), store)
+    held = np.array([0.4, 0.4])
+
+    DeltaLimitApprover.rewind_reference(store, held)
+    held[:] = 0.9
+    out = approver.review(Action(data=np.array([0.8, 0.8])), store)
+
+    assert np.allclose(out.data, [0.5, 0.5])
+
+
+def test_rewind_reference_uses_the_limiter_store_key() -> None:
+    approver = DeltaLimitApprover(_abs_space(), max_delta=0.1)
+    store: dict[str, object] = {}
+    approver.review(Action(data=np.array([0.0, 0.0])), store)
+
+    assert set(store) == {"delta_limit:last"}
+    DeltaLimitApprover.rewind_reference(store, np.array([0.3, 0.4]))
+    reference = store["delta_limit:last"]
+    assert isinstance(reference, np.ndarray)
+    assert np.array_equal(reference, np.array([0.3, 0.4]))
+
+
+def test_substitution_rewinds_the_next_delta_reference() -> None:
+    held = Action(data=np.array([0.0, 0.0]))
+
+    class _HoldSecondTarget:
+        def __init__(self) -> None:
+            self._calls = 0
+
+        def review(self, action: Action, store: dict[str, Any]) -> Action:
+            self._calls += 1
+            if self._calls == 2:
+                DeltaLimitApprover.rewind_reference(store, np.asarray(held.data, dtype=np.float64))
+                return held
+            return action
+
+    chain = ChainApprover(
+        DeltaLimitApprover(_abs_space(), max_delta=0.1),
+        _HoldSecondTarget(),
+    )
+    store: dict[str, object] = {}
+    assert chain.review(held, store) is held
+    assert chain.review(Action(data=np.array([0.1, 0.0])), store) is held
+
+    out = chain.review(Action(data=np.array([0.2, 0.0])), store)
+
+    assert np.allclose(out.data, [0.1, 0.0])
+
+
 def test_absolute_derived_default_is_five_percent_of_range() -> None:
     approver = DeltaLimitApprover(_abs_space())  # ranges: 2.0 and 1.0
     store: dict[str, object] = {}
     approver.review(Action(data=np.array([0.0, 0.5])), store)
     out = approver.review(Action(data=np.array([1.0, 0.0])), store)
     assert np.allclose(out.data, [0.1, 0.45])  # 0.05 * (high - low) per dim
+
+
+def test_absolute_derived_default_keeps_the_box_shape_for_multi_d_boxes() -> None:
+    # The derived delta must broadcast against multi-dimensional actions; a
+    # flat (dim,) delta would raise in review() for a (2, 3) box.
+    space = Box(
+        shape=(2, 3),
+        low=np.zeros((2, 3)),
+        high=np.full((2, 3), 2.0),
+        semantics=ActionSemantics("joint_pos", max_step=(None, None, None, None, None, 0.5)),
+    )
+    approver = DeltaLimitApprover(space)
+    store: dict[str, object] = {}
+    approver.review(Action(data=np.zeros((2, 3))), store)
+    out = approver.review(Action(data=np.full((2, 3), 2.0)), store)
+    # Undeclared dims clamp to 5% of range (0.1); the flat declaration maps to
+    # the last element of the flattened box (0.5).
+    assert np.allclose(out.data, [[0.1, 0.1, 0.1], [0.1, 0.1, 0.5]])
+
+
+def test_absolute_derived_default_mixes_declared_and_native_range_limits() -> None:
+    low = np.array([-1.0, 0.0], dtype=np.float16)
+    high = np.array([1.0, 1.0], dtype=np.float16)
+    space = Box(
+        shape=(2,),
+        low=low,
+        high=high,
+        semantics=ActionSemantics("joint_pos", max_step=(None, 0.2)),
+    )
+    approver = DeltaLimitApprover(space)
+    store: dict[str, object] = {}
+    approver.review(Action(data=np.array([0.0, 0.0])), store)
+    out = approver.review(Action(data=np.array([1.0, 1.0])), store)
+    native_default = np.asarray(0.05 * (high - low), dtype=np.float64)
+
+    assert np.array_equal(out.data, np.array([native_default[0], 0.2]))
+
+
+def test_all_declared_absolute_space_needs_no_finite_bounds() -> None:
+    space = Box(
+        shape=(2,),
+        low=np.array([float("-inf"), float("nan")]),
+        high=np.array([float("inf"), float("nan")]),
+        semantics=ActionSemantics("joint_pos", max_step=(0.1, 0.2)),
+    )
+    DeltaLimitApprover(space)
+
+
+def test_undeclared_absolute_dimension_still_needs_finite_bounds() -> None:
+    space = Box(
+        shape=(2,),
+        low=np.array([float("-inf"), 0.0]),
+        high=np.array([float("inf"), float("inf")]),
+        semantics=ActionSemantics("joint_pos", max_step=(0.1, None)),
+    )
+    with pytest.raises(ValueError, match="finite low/high bounds"):
+        DeltaLimitApprover(space)
+
+
+def test_explicit_max_delta_overrides_declarations() -> None:
+    space = Box(
+        shape=(1,),
+        low=np.array([0.0]),
+        high=np.array([1.0]),
+        semantics=ActionSemantics("joint_pos", max_step=(0.01,)),
+    )
+    approver = DeltaLimitApprover(space, max_delta=0.5)
+    store: dict[str, object] = {}
+    approver.review(Action(data=np.array([0.0])), store)
+    within_override = Action(data=np.array([0.4]))
+
+    assert approver.review(within_override, store) is within_override
+
+
+def test_explicit_max_delta_broadcasts_to_a_multidimensional_box() -> None:
+    # A bimanual (2, 7) box: an explicit max_delta must reach review() shaped
+    # like the action, exactly as the derived default does (#287).
+    shape = (2, 7)
+    space = Box(
+        shape=shape,
+        low=np.full(shape, -1.0),
+        high=np.full(shape, 1.0),
+        semantics=ActionSemantics("joint_pos"),
+    )
+    approver = DeltaLimitApprover(space, max_delta=0.1)
+    store: dict[str, object] = {}
+    approver.review(Action(data=np.zeros(shape)), store)
+    out = approver.review(Action(data=np.full(shape, 5.0)), store)
+
+    assert np.allclose(out.data, np.full(shape, 0.1))
+    assert out.meta.get("delta_clamped") is True
 
 
 def test_stores_are_isolated_per_trial() -> None:
@@ -175,6 +353,69 @@ def test_displacement_explicit_limit_intersects_box() -> None:
     # dim0: min(high=0.1, +0.05) → 0.05; dim1: max(low=0.0, -0.05) → 0.0.
     assert np.allclose(out.data, [0.05, 0.0])
     assert out.meta.get("delta_clamped") is True
+
+
+def test_displacement_explicit_limit_broadcasts_to_a_multidimensional_box() -> None:
+    # The displacement branch intersects the limit with the box at construction
+    # time, so a flat delta fails there instead of in review() (#287).
+    shape = (2, 7)
+    space = Box(
+        shape=shape,
+        low=np.full(shape, -1.0),
+        high=np.full(shape, 1.0),
+        semantics=ActionSemantics("joint_delta"),
+    )
+    approver = DeltaLimitApprover(space, max_delta=0.1)
+    out = approver.review(Action(data=np.full(shape, 5.0)), {})
+
+    assert np.allclose(out.data, np.full(shape, 0.1))
+    assert out.meta.get("delta_clamped") is True
+
+
+def test_displacement_explicit_multidimensional_max_delta_array() -> None:
+    shape = (2, 3)
+    space = Box(
+        shape=shape,
+        low=np.full(shape, -1.0),
+        high=np.full(shape, 1.0),
+        semantics=ActionSemantics("joint_delta"),
+    )
+    max_delta = np.array([[0.05, 0.1, 0.15], [0.2, 0.25, 0.3]])
+    approver = DeltaLimitApprover(space, max_delta=max_delta)
+    out = approver.review(Action(data=np.full(shape, 1.0)), {})
+    assert np.allclose(out.data, max_delta)
+    assert out.meta.get("delta_clamped") is True
+
+
+def test_absolute_explicit_multidimensional_max_delta_array() -> None:
+    shape = (2, 3)
+    space = Box(
+        shape=shape,
+        low=np.full(shape, -10.0),
+        high=np.full(shape, 10.0),
+        semantics=ActionSemantics("joint_pos"),
+    )
+    max_delta = np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    approver = DeltaLimitApprover(space, max_delta=max_delta)
+    store: dict[str, Any] = {}
+    first = Action(data=np.zeros(shape))
+    assert approver.review(first, store) is first
+    second = Action(data=np.full(shape, 5.0))
+    out = approver.review(second, store)
+    assert np.allclose(out.data, max_delta)
+    assert out.meta.get("delta_clamped") is True
+
+
+def test_refuses_unbroadcastable_max_delta_array() -> None:
+    shape = (2, 3)
+    space = Box(
+        shape=shape,
+        low=np.full(shape, -1.0),
+        high=np.full(shape, 1.0),
+        semantics=ActionSemantics("joint_pos"),
+    )
+    with pytest.raises(ValueError, match="does not broadcast"):
+        DeltaLimitApprover(space, max_delta=np.ones((4, 4)))
 
 
 def test_displacement_derived_default_is_box_alone() -> None:
@@ -205,6 +446,21 @@ def test_nan_raises_safety_abort_in_both_branches() -> None:
         approver = DeltaLimitApprover(space, max_delta=0.1)
         with pytest.raises(SafetyAbort, match="NaN"):
             approver.review(Action(data=np.array([float("nan"), 0.0])), {})
+
+
+@pytest.mark.parametrize("name", ["", "line\nbreak", "line\rbreak"])
+def test_guardrail_contribution_rejects_invalid_display_names(name: str) -> None:
+    with pytest.raises(ValueError, match="display names"):
+        GuardrailContribution(approvers=((name, AutoApprover()),))
+
+
+def test_guardrail_contribution_requires_callable_review() -> None:
+    class _NotAnApprover:
+        review = 7
+
+    broken: Any = _NotAnApprover()
+    with pytest.raises(ValueError, match="callable review"):
+        GuardrailContribution(approvers=(("broken", broken),))
 
 
 def test_chain_runs_approvers_in_order() -> None:

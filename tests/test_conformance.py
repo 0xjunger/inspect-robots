@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+import errno
+from pathlib import Path
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
 
 from inspect_robots.conformance import (
     DeviceSlot,
+    NumberSlot,
+    OptionSlot,
     assert_embodiment_conformant,
+    check_device_slots,
     check_embodiment,
     device_slots,
     missing_runtime_requirements,
+    number_slots,
+    option_slots,
 )
 from inspect_robots.embodiment import EmbodimentInfo
 from inspect_robots.mock import CubePickEmbodiment
@@ -114,6 +121,166 @@ def test_device_slots_attribute_or_iteration_failure_is_empty() -> None:
     assert device_slots(_Factory) == ()
 
 
+def test_option_slots_absent_attribute_is_empty() -> None:
+    class _Factory:
+        pass
+
+    assert option_slots(_Factory) == ()
+    assert option_slots(None) == ()
+
+
+def test_option_slots_valid_tuple_round_trips_in_order() -> None:
+    slots = (
+        OptionSlot(
+            arg="auto_start",
+            label="Skip the operator start prompts (auto_start)",
+        ),
+        OptionSlot(arg="verbose", label="Verbose", default=True),
+    )
+
+    class _Factory:
+        OPTION_SLOTS: ClassVar[tuple[OptionSlot, ...]] = slots
+
+    assert option_slots(_Factory) == slots
+
+
+def test_option_slots_default_is_false() -> None:
+    assert OptionSlot(arg="a", label="A").default is False
+
+
+def test_option_slots_accepts_lists_and_ignores_offending_entries() -> None:
+    valid = OptionSlot(arg="auto_start", label="Auto start")
+
+    class _Factory:
+        OPTION_SLOTS: ClassVar[list[object]] = [
+            "not a slot",
+            valid,
+            None,
+        ]
+
+    assert option_slots(_Factory) == (valid,)
+
+
+@pytest.mark.parametrize("garbage", [7, None])
+def test_option_slots_whole_value_garbage_is_empty(garbage: object) -> None:
+    class _Factory:
+        OPTION_SLOTS: ClassVar[object] = garbage
+
+    assert option_slots(_Factory) == ()
+
+
+def test_option_slots_attribute_or_iteration_failure_is_empty() -> None:
+    class _BrokenAttribute:
+        @property
+        def OPTION_SLOTS(self) -> object:
+            raise RuntimeError("broken descriptor")
+
+    class _BrokenIteration:
+        def __iter__(self) -> object:
+            raise RuntimeError("broken iterator")
+
+    class _Factory:
+        OPTION_SLOTS: ClassVar[object] = _BrokenIteration()
+
+    assert option_slots(_BrokenAttribute()) == ()
+    assert option_slots(_Factory) == ()
+
+
+def test_number_slots_absent_attribute_is_empty() -> None:
+    class _Factory:
+        pass
+
+    assert number_slots(_Factory) == ()
+    assert number_slots(None) == ()
+
+
+def test_number_slots_valid_tuple_round_trips_in_order() -> None:
+    slots = (
+        NumberSlot("temperature", "Motor temperature (C)", 70, 1, 100, True),
+        NumberSlot("gain", "Gain", 0.5),
+    )
+
+    class _Factory:
+        NUMBER_SLOTS: ClassVar[tuple[NumberSlot, ...]] = slots
+
+    assert number_slots(_Factory) == slots
+
+
+def test_number_slot_field_defaults() -> None:
+    slot = NumberSlot(arg="gain", label="Gain")
+
+    assert slot.default is None
+    assert slot.minimum is None
+    assert slot.maximum is None
+    assert slot.allow_none is False
+
+
+def test_number_slots_accepts_lists_and_ignores_offending_entries() -> None:
+    valid = NumberSlot(arg="gain", label="Gain", default=1)
+
+    class _Factory:
+        NUMBER_SLOTS: ClassVar[list[object]] = [
+            "not a slot",
+            valid,
+            None,
+        ]
+
+    assert number_slots(_Factory) == (valid,)
+
+
+@pytest.mark.parametrize("garbage", [7, None])
+def test_number_slots_whole_value_garbage_is_empty(garbage: object) -> None:
+    class _Factory:
+        NUMBER_SLOTS: ClassVar[object] = garbage
+
+    assert number_slots(_Factory) == ()
+
+
+def test_number_slots_attribute_or_iteration_failure_is_empty() -> None:
+    class _BrokenAttribute:
+        @property
+        def NUMBER_SLOTS(self) -> object:
+            raise RuntimeError("broken descriptor")
+
+    class _BrokenIteration:
+        def __iter__(self) -> object:
+            raise RuntimeError("broken iterator")
+
+    class _Factory:
+        NUMBER_SLOTS: ClassVar[object] = _BrokenIteration()
+
+    assert number_slots(_BrokenAttribute()) == ()
+    assert number_slots(_Factory) == ()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        NumberSlot("bad", "Bad", default=True),
+        NumberSlot("bad", "Bad", default=1, minimum=True),
+        NumberSlot("bad", "Bad", default=1, maximum=False),
+        NumberSlot("bad", "Bad", default=float("nan")),
+        NumberSlot("bad", "Bad", default=float("inf")),
+        NumberSlot("bad", "Bad", default=1, minimum=float("nan")),
+        NumberSlot("bad", "Bad", default=1, maximum=float("inf")),
+        NumberSlot("bad", "Bad", default=1, minimum=2, maximum=1),
+        NumberSlot("bad", "Bad", default=0, minimum=1),
+        NumberSlot("bad", "Bad", default=2, maximum=1),
+        NumberSlot("bad", "Bad"),
+    ],
+)
+def test_number_slots_ignore_invalid_declarations_and_keep_valid_siblings(
+    invalid: NumberSlot,
+) -> None:
+    first = NumberSlot("first", "First", default=1)
+    last = NumberSlot("last", "Last", allow_none=True)
+
+    class _Factory:
+        NUMBER_SLOTS: ClassVar[tuple[NumberSlot, ...]] = (first, invalid, last)
+
+    assert number_slots(_Factory) == (first, last)
+
+
 def test_runtime_requirements_absent_attribute_is_empty() -> None:
     class _Factory:
         pass
@@ -182,6 +349,109 @@ def test_non_string_runtime_requirement_entries_are_ignored() -> None:
         }
 
     assert missing_runtime_requirements(_Factory) == {"definitely_missing_xyz": "install valid"}
+
+
+def test_device_slots_no_declaration_has_no_findings(tmp_path: Path) -> None:
+    class _Factory:
+        pass
+
+    assert check_device_slots(_Factory, {"cam": "x"}, sysfs_net=tmp_path) == []
+    assert check_device_slots(None, {"cam": "x"}, sysfs_net=tmp_path) == []
+
+
+def test_device_slots_report_missing_path_and_can_in_declaration_order(tmp_path: Path) -> None:
+    sysfs_net = tmp_path / "net"
+    sysfs_net.mkdir()
+
+    class _Factory:
+        DEVICE_SLOTS: ClassVar[tuple[DeviceSlot, ...]] = (
+            DeviceSlot(arg="left_bus", kind="can", label="left arm CAN"),
+            DeviceSlot(arg="wrist_cam", kind="v4l2", label="wrist camera"),
+        )
+
+    issues = check_device_slots(
+        _Factory,
+        {"left_bus": "can_absent", "wrist_cam": str(tmp_path / "missing-cam")},
+        sysfs_net=sysfs_net,
+    )
+    assert [i.code for i in issues] == ["device", "device"]
+    assert all(i.severity == "error" for i in issues)
+    assert "left arm CAN" in issues[0].message and "can_absent" in issues[0].message
+    assert "present: none" in issues[0].message
+    assert "wrist camera" in issues[1].message and "missing-cam" in issues[1].message
+
+
+def test_device_slots_present_can_and_existing_path_pass(tmp_path: Path) -> None:
+    sysfs_net = tmp_path / "net"
+    (sysfs_net / "can0").mkdir(parents=True)
+    (sysfs_net / "can0" / "type").write_text("280", encoding="utf-8")
+    port = tmp_path / "ttyUSB0"
+    port.write_text("", encoding="utf-8")
+
+    class _Factory:
+        DEVICE_SLOTS: ClassVar[tuple[DeviceSlot, ...]] = (
+            DeviceSlot(arg="bus", kind="can", label="arm CAN"),
+            DeviceSlot(arg="serial", kind="serial", label="gripper serial"),
+        )
+
+    issues = check_device_slots(_Factory, {"bus": "can0", "serial": str(port)}, sysfs_net=sysfs_net)
+    assert issues == []
+
+
+def test_device_slots_present_can_interfaces_listed_on_miss(tmp_path: Path) -> None:
+    sysfs_net = tmp_path / "net"
+    (sysfs_net / "can0").mkdir(parents=True)
+    (sysfs_net / "can0" / "type").write_text("280", encoding="utf-8")
+
+    class _Factory:
+        DEVICE_SLOTS: ClassVar[tuple[DeviceSlot, ...]] = (
+            DeviceSlot(arg="bus", kind="can", label="arm CAN"),
+        )
+
+    issues = check_device_slots(_Factory, {"bus": "can_left"}, sysfs_net=sysfs_net)
+    assert len(issues) == 1
+    assert "present: can0" in issues[0].message
+
+
+def test_device_slots_unconfigured_and_disabled_values_are_skipped(tmp_path: Path) -> None:
+    class _Factory:
+        DEVICE_SLOTS: ClassVar[tuple[DeviceSlot, ...]] = (
+            DeviceSlot(arg="cam", kind="v4l2", label="camera"),
+            DeviceSlot(arg="right_bus", kind="can", label="right arm CAN"),
+        )
+
+    issues = check_device_slots(_Factory, {"right_bus": None}, sysfs_net=tmp_path)
+    assert issues == []
+
+
+def test_device_slots_report_unreadable_path_and_keep_checking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    locked = tmp_path / "locked" / "cam0"
+    real_exists = Path.exists
+
+    def failing_exists(self: Path, *args: Any, **kwargs: Any) -> bool:
+        if self == locked:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", failing_exists)
+
+    class _Factory:
+        DEVICE_SLOTS: ClassVar[tuple[DeviceSlot, ...]] = (
+            DeviceSlot(arg="wrist_cam", kind="v4l2", label="wrist camera"),
+            DeviceSlot(arg="gripper", kind="serial", label="gripper serial"),
+        )
+
+    issues = check_device_slots(
+        _Factory,
+        {"wrist_cam": str(locked), "gripper": str(tmp_path / "no-serial")},
+        sysfs_net=tmp_path,
+    )
+    assert [i.code for i in issues] == ["device", "device"]
+    assert "wrist camera" in issues[0].message
+    assert "could not be checked: Permission denied" in issues[0].message
+    assert "gripper serial" in issues[1].message and "does not exist" in issues[1].message
 
 
 def test_good_absolute_and_displacement_pass() -> None:
@@ -312,6 +582,27 @@ def test_delta_pose_euler_rotation_deltas_are_guardrail_conformant() -> None:
         ),
     )
     assert "guardrails" not in _codes(info)
+
+
+def test_delta_pose_rot6d_rotation_deltas_are_a_guardrail_error() -> None:
+    # A rot6d delta's identity is (1, 0, 0, 0, 1, 0), not the zero vector:
+    # per-dimension clamping distorts it and post-clamp Gram-Schmidt
+    # re-normalization can amplify the rotation instead of limiting it, the
+    # same failure class as an absolute quaternion. 3 xyz + 6 rot6d + 1
+    # gripper = 10 dims.
+    info = _info(
+        space=Box(
+            shape=(10,),
+            low=np.full(10, -0.1),
+            high=np.full(10, 0.1),
+            semantics=ActionSemantics(
+                "eef_delta_pose",
+                rotation_repr="rot6d",
+                dim_labels=tuple("abcdefghij"),
+            ),
+        ),
+    )
+    assert _codes(info)["guardrails"] == "error"
 
 
 def test_missing_control_hz_is_a_warning() -> None:

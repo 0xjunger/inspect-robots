@@ -7,14 +7,24 @@ from pathlib import Path
 
 import pytest
 
-from inspect_robots._defaults import (
-    ENV_EMBODIMENT,
-    ENV_POLICY,
-    ENV_SIM_EMBODIMENT,
+from inspect_robots.defaults import (
+    _ENV_EMBODIMENT as ENV_EMBODIMENT,
+)
+from inspect_robots.defaults import (
+    _ENV_POLICY as ENV_POLICY,
+)
+from inspect_robots.defaults import (
+    _ENV_SIM_EMBODIMENT as ENV_SIM_EMBODIMENT,
+)
+from inspect_robots.defaults import (
     Defaults,
     load_defaults,
-    parse_value,
-    set_default,
+)
+from inspect_robots.defaults import (
+    _parse_value as parse_value,
+)
+from inspect_robots.defaults import (
+    _set_default as set_default,
 )
 
 
@@ -59,6 +69,34 @@ def test_full_config_parses_with_inline_comments_and_expansion(tmp_path: Path) -
     assert d.policy_args["temperature"] == 0.5
     assert d.policy_args["verbose"] is True
     assert d.embodiment_args == {"cameras": "wrist,front", "port": None}
+
+
+def test_grader_args_section_parses_with_the_grader_as_owner(tmp_path: Path) -> None:
+    _write_config(
+        tmp_path,
+        "[defaults]\ngrader = vlm\n[grader.args]\nmodel = judge\nmax_cameras = 2\n",
+    )
+    d = load_defaults({"XDG_CONFIG_HOME": str(tmp_path)})
+    assert d.grader == "vlm"
+    assert d.grader_args == {"model": "judge", "max_cameras": 2}
+    assert d.grader_args_owner == "vlm"
+
+
+def test_taskgen_args_section_parses_without_an_owner(tmp_path: Path) -> None:
+    """Parse [taskgen.args] like the other args sections, with no owner field."""
+    _write_config(
+        tmp_path,
+        "[taskgen.args]\nmodel = gpt-5.2\nmax_cameras = 2\n"
+        "instructions_file = ~/prompts/jungle.txt\n",
+    )
+    d = load_defaults({"XDG_CONFIG_HOME": str(tmp_path)})
+    assert d.taskgen_args["model"] == "gpt-5.2"
+    assert d.taskgen_args["max_cameras"] == 2
+    instructions_file = d.taskgen_args["instructions_file"]
+    assert isinstance(instructions_file, str) and not instructions_file.startswith("~")
+    assert instructions_file.endswith("prompts/jungle.txt")
+    # Deliberately ownerless (plan 0071): taskgen is never registry-selected.
+    assert not hasattr(d, "taskgen_args_owner")
 
 
 def test_config_value_with_literal_percent_loads_unchanged(tmp_path: Path) -> None:
@@ -150,6 +188,15 @@ def test_parse_value_scalars() -> None:
     assert parse_value("42") == 42
     assert parse_value("2.5") == 2.5
     assert parse_value("hello") == "hello"
+    assert parse_value("'none'") == "none"
+    assert parse_value('"true"') == "true"
+    assert parse_value("nan") == "nan"
+    assert parse_value("NaN") == "NaN"
+    assert parse_value("inf") == "inf"
+    assert parse_value("-inf") == "-inf"
+    assert parse_value("+inf") == "+inf"
+    assert parse_value("infinity") == "infinity"
+    assert parse_value("-infinity") == "-infinity"
 
 
 _SIM_CONFIG = """
@@ -236,6 +283,88 @@ def test_config_rerun_rejects_non_bool(tmp_path: Path) -> None:
         load_defaults({"XDG_CONFIG_HOME": str(config_home)})
 
 
+@pytest.mark.parametrize(("raw", "expected"), [("true", True), ("false", False)])
+def test_config_rerun_save_parses_bool(tmp_path: Path, raw: str, expected: bool) -> None:
+    """The per-rig recording default accepts only explicit booleans."""
+    config_home = tmp_path / "cfg"
+    _write_config(config_home, f"[defaults]\nrerun_save = {raw}\n")
+    assert load_defaults({"XDG_CONFIG_HOME": str(config_home)}).rerun_save is expected
+
+
+def test_config_rerun_save_defaults_true(tmp_path: Path) -> None:
+    """Live runs save by default when the key is absent."""
+    config_home = tmp_path / "cfg"
+    _write_config(config_home, "[defaults]\npolicy = x\n")
+    assert load_defaults({"XDG_CONFIG_HOME": str(config_home)}).rerun_save is True
+
+
+def test_config_rerun_save_rejects_non_bool(tmp_path: Path) -> None:
+    """A non-boolean recording default is rejected with the documented message."""
+    config_home = tmp_path / "cfg"
+    path = _write_config(config_home, "[defaults]\nrerun_save = sometimes\n")
+    with pytest.raises(
+        SystemExit,
+        match=(
+            rf"{re.escape(str(path))}.*\[defaults\] rerun_save must be true or false, "
+            "got 'sometimes'"
+        ),
+    ):
+        load_defaults({"XDG_CONFIG_HOME": str(config_home)})
+
+
+def test_set_default_validates_and_round_trips_rerun_save(tmp_path: Path) -> None:
+    """Config editing applies the same boolean contract as config loading."""
+    env = {"XDG_CONFIG_HOME": str(tmp_path)}
+    with pytest.raises(SystemExit, match="rerun_save must be true or false"):
+        set_default(env, "rerun_save", "sometimes")
+    set_default(env, "rerun_save", "false")
+    assert load_defaults(env).rerun_save is False
+
+
+def test_set_default_validates_and_round_trips_max_steps(tmp_path: Path) -> None:
+    env = {"XDG_CONFIG_HOME": str(tmp_path)}
+    with pytest.raises(SystemExit, match="max_steps must be an integer >= 1"):
+        set_default(env, "max_steps", "0")
+    set_default(env, "max_steps", "350")
+    assert load_defaults(env).max_steps == 350
+
+
+def test_set_default_validates_and_round_trips_rerun_port(tmp_path: Path) -> None:
+    env = {"XDG_CONFIG_HOME": str(tmp_path)}
+    with pytest.raises(SystemExit, match="rerun_port must be an integer in 1-65535"):
+        set_default(env, "rerun_port", "99999")
+    set_default(env, "rerun_port", "9876")
+    assert load_defaults(env).rerun_port == 9876
+
+
+def test_set_default_validates_boolean_keys(tmp_path: Path) -> None:
+    env = {"XDG_CONFIG_HOME": str(tmp_path)}
+    with pytest.raises(SystemExit, match="rerun must be true or false"):
+        set_default(env, "rerun", "maybe")
+    set_default(env, "rerun", "true")
+    assert load_defaults(env).rerun is True
+
+
+def test_config_rerun_port_parses_int(tmp_path: Path) -> None:
+    config_home = tmp_path / "cfg"
+    _write_config(config_home, "[defaults]\nrerun_port = 9877\n")
+    assert load_defaults({"XDG_CONFIG_HOME": str(config_home)}).rerun_port == 9877
+
+
+def test_config_rerun_port_defaults_none(tmp_path: Path) -> None:
+    config_home = tmp_path / "cfg"
+    _write_config(config_home, "[defaults]\npolicy = x\n")
+    assert load_defaults({"XDG_CONFIG_HOME": str(config_home)}).rerun_port is None
+
+
+@pytest.mark.parametrize("bad", ["true", "0", "65536", "9876.5"])
+def test_config_rerun_port_rejects_invalid(tmp_path: Path, bad: str) -> None:
+    config_home = tmp_path / "cfg"
+    path = _write_config(config_home, f"[defaults]\nrerun_port = {bad}\n")
+    with pytest.raises(SystemExit, match=rf"{re.escape(str(path))}.*1-65535"):
+        load_defaults({"XDG_CONFIG_HOME": str(config_home)})
+
+
 def test_set_default_requires_config_home() -> None:
     with pytest.raises(SystemExit, match="config home"):
         set_default({}, "policy", "scripted")
@@ -249,7 +378,7 @@ def test_set_default_rejects_malformed_existing_config(tmp_path: Path) -> None:
         set_default({"XDG_CONFIG_HOME": str(tmp_path)}, "policy", "scripted")
 
 
-@pytest.mark.parametrize("key", ["policy", "embodiment", "sim_embodiment"])
+@pytest.mark.parametrize("key", ["policy", "embodiment", "sim_embodiment", "grader"])
 def test_set_default_warns_when_component_change_leaves_owned_args(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], key: str
 ) -> None:
@@ -285,3 +414,9 @@ def test_set_default_does_not_warn_when_args_have_no_prior_owner(
     _write_config(tmp_path, "[embodiment.args]\nport = can0\n")
     set_default({"XDG_CONFIG_HOME": str(tmp_path)}, "embodiment", "new-arm")
     assert capsys.readouterr().err == ""
+
+
+def test_public_re_export_init_dotenv() -> None:
+    from inspect_robots.defaults import init_dotenv
+
+    assert init_dotenv is not None

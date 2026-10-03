@@ -76,11 +76,82 @@ DEVICE_SLOTS = (
 )
 ```
 
+These declarations also feed a run-time advisory device claim. If two evals
+name the same device, the second fails at startup instead of double-driving the
+hardware. The claim is `flock`-based and vanishes with the process. Claims are
+per-user, so they do not guard against two different users driving one rig.
+Camera and serial paths count as the same device after resolving symlinks,
+while CAN interface names are compared verbatim, so `can0` in one config and a
+udev-pinned alias for the same adapter in another do not collide. On hosts
+without `XDG_RUNTIME_DIR`, the fallback lock directory lives under the
+world-writable temporary directory, and the guard refuses lock directories it
+does not own. The guard is a safety net against your own concurrent evals, not
+a security boundary.
+
 The recognized kinds are `v4l2` for stable camera paths, `can` for SocketCAN
 interface names, and `serial` for absolute `/dev/serial/by-id` paths. The setup
 wizard probes and interviews slots in declaration order, then writes each
 selection to its `arg` key under `[embodiment.args]`. Slots with the same
 non-`None` `group` are all-or-none. Ungrouped slots remain independent.
+
+## Declare option slots
+
+Declare boolean behavior toggles on the registered embodiment factory. Import
+[`OptionSlot`](/api/#inspect_robots.conformance.OptionSlot) from the
+`inspect_robots.conformance` submodule:
+
+```python
+from inspect_robots.conformance import OptionSlot
+
+OPTION_SLOTS = (
+    OptionSlot(
+        arg="auto_start",
+        label="Skip the operator start prompts (auto_start)",
+    ),
+)
+```
+
+Each slot is one yes/no question in the setup wizard. Its `arg` is the
+`[embodiment.args]` key written as `true` or `false`. On re-runs, the carried
+config value is the suggested answer. A declaration is skipped when its `arg`
+collides with a device slot, a camera key, or an earlier option declaration.
+
+## Declare number slots
+
+Declare finite numeric settings on the registered embodiment factory. Import
+[`NumberSlot`](/api/#inspect_robots.conformance.NumberSlot) from the
+`inspect_robots.conformance` submodule:
+
+```python
+from inspect_robots.conformance import NumberSlot
+
+NUMBER_SLOTS = (
+    NumberSlot(
+        arg="motor_temp_limit",
+        label="Motor temperature limit (degrees C)",
+        default=70,
+        minimum=1,
+        allow_none=True,
+    ),
+)
+```
+
+The written value determines the type the constructor receives: `70` arrives
+as `int`, `70.5` as `float`, and `none` as `None`. Annotate the constructor
+argument as `float | int | None` or coerce, rather than assuming `float`.
+
+Each slot writes one `[embodiment.args]` value. Bounds are inclusive, and an
+omitted bound leaves that side unbounded. Set `allow_none=True` to accept
+`none` or `null` as a disabled value. On re-runs, a valid carried config value
+is the suggestion; otherwise the declared default is used. Number slots are
+asked after option slots. A declaration is skipped when its `arg` collides
+with a device slot, a camera key, an option slot, or an earlier number slot.
+
+Importing `NumberSlot` requires the inspect-robots core release that provides
+it. On an older core, that import fails while the plugin entry point loads and
+drops the whole plugin, rather than silently ignoring only `NUMBER_SLOTS`.
+Plugins that adopt number slots must raise their minimum inspect-robots
+version accordingly.
 
 ## The conformance kit
 
@@ -112,7 +183,7 @@ constructor hardware-free; connect in `reset()`).
 | `bounds` | Finite `low`/`high` on every dim. Without them the bounds clamp is skipped and no default delta limit can be derived. |
 | `dim_labels` | Every dim is named (`("left_j0", ..., "right_gripper")`), uniquely. The agent moves joints by these names. |
 | `state_alignment` | Absolute-target modes (`joint_pos`, `eef_abs_pose`) declare exactly one `StateSpec` field with `shape == (action_dim,)`: the proprioceptive reference the agent interpolates from. |
-| `guardrails` | `DeltaLimitApprover(action_space)` constructs. This catches absolute pose modes (`eef_abs_pose`) whose rotation representation cannot be clamped per dimension (`quat_*`, `axis_angle`, `euler_xyz`; use `none` or `rot6d`), and displacement pose modes (`eef_delta_pose`) carrying a quaternion delta (`quat_wxyz`, `quat_xyzw`; use `none`, `rot6d`, `axis_angle`, or `euler_xyz`). |
+| `guardrails` | `DeltaLimitApprover(action_space)` constructs. This catches absolute pose modes (`eef_abs_pose`) whose rotation representation cannot be clamped per dimension (`quat_*`, `axis_angle`, `euler_xyz`; use `none` or `rot6d`), and displacement pose modes (`eef_delta_pose`) whose rotation representation's identity is not the zero vector (`quat_*`, `rot6d`; use `none`, `axis_angle`, or `euler_xyz`). |
 
 ### Warnings
 

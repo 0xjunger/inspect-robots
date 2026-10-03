@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from inspect_robots.embodiment import EmbodimentInfo
 from inspect_robots.mock import CubePickEmbodiment
 from inspect_robots.spaces import (
+    ABSOLUTE_CONTROL_MODES,
     ActionSemantics,
     Box,
     CameraSpec,
@@ -84,6 +86,8 @@ def test_action_semantics_defaults() -> None:
     assert sem.rotation_repr == "none"
     assert sem.gripper == "none"
     assert sem.frame == "base"
+    assert sem.max_step is None
+    assert {"joint_pos", "eef_abs_pose"} == ABSOLUTE_CONTROL_MODES
 
 
 def test_action_semantics_joint_delta_and_dim_labels() -> None:
@@ -100,6 +104,72 @@ def test_box_validates_dim_labels_length() -> None:
     assert Box(shape=(3,), semantics=labeled).dim == 3
     # No labels: any dim is fine.
     Box(shape=(2,), semantics=ActionSemantics(control_mode="joint_pos"))
+
+
+def test_action_semantics_max_step_round_trips_with_value_semantics() -> None:
+    sem = ActionSemantics(
+        control_mode="joint_pos",
+        dim_labels=("joint", "gripper"),
+        max_step=(None, 0.1),
+    )
+    same = ActionSemantics(
+        control_mode="joint_pos",
+        dim_labels=("joint", "gripper"),
+        max_step=(None, 0.1),
+    )
+    different = dataclasses.replace(sem, max_step=(None, 0.2))
+    box = Box(
+        shape=(2,),
+        low=np.array([-1.0, 0.0]),
+        high=np.array([1.0, 1.0]),
+        semantics=sem,
+    )
+
+    assert box.semantics is sem
+    assert sem.max_step == (None, 0.1)
+    assert sem == same
+    assert hash(sem) == hash(same)
+    assert sem != different
+
+
+def test_box_validates_max_step_length() -> None:
+    semantics = ActionSemantics(control_mode="joint_pos", max_step=(0.1,))
+    with pytest.raises(ValueError, match=r"max_step has 1 entries.*2 dimensions"):
+        Box(shape=(2,), semantics=semantics)
+    assert Box(shape=(1,), semantics=semantics).dim == 1
+
+
+@pytest.mark.parametrize("entry", [0.0, -0.1, float("nan"), float("inf"), float("-inf")])
+def test_action_semantics_rejects_invalid_max_step_entries(entry: float) -> None:
+    with pytest.raises(ValueError, match="max_step entries must be finite and > 0"):
+        ActionSemantics(control_mode="joint_pos", max_step=(entry,))
+
+
+def test_action_semantics_allows_none_max_step_entries() -> None:
+    assert ActionSemantics(control_mode="joint_pos", max_step=(None, 0.1)).max_step == (
+        None,
+        0.1,
+    )
+    assert ActionSemantics(control_mode="joint_delta", max_step=(None,)).max_step == (None,)
+
+
+def test_action_semantics_rejects_declared_step_for_non_absolute_mode() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"displacement boxes already declare per-step limits via low/high",
+    ):
+        ActionSemantics(control_mode="joint_delta", max_step=(None, 0.1))
+
+
+def test_box_rejects_max_step_on_pinned_dimension() -> None:
+    semantics = ActionSemantics(control_mode="joint_pos", max_step=(None, 0.1))
+    with pytest.raises(ValueError, match=r"pinned dimension.*low == high"):
+        Box(
+            shape=(2,),
+            low=np.array([-1.0, 0.0]),
+            high=np.array([1.0, 0.0]),
+            semantics=semantics,
+        )
 
 
 def test_observation_space_derives_state_keys_from_spec() -> None:
@@ -127,14 +197,121 @@ def test_observation_space_rejects_inconsistent_state_keys() -> None:
 
 
 def test_task_envelope_is_a_frozen_view_of_the_horizon() -> None:
+    from inspect_robots.errors import ConfigError
     from inspect_robots.scene import Scene
     from inspect_robots.task import Task, TaskEnvelope
 
     scene = Scene(id="s", instruction="x")
     task = Task(name="t", scenes=[scene], scorer="success_at_end", max_steps=80)
     assert task.envelope == TaskEnvelope(name="t", max_steps=80)
+    assert task.resolve_envelope(None) == task.envelope
     with pytest.raises(AttributeError):
         task.envelope.max_steps = 81  # type: ignore[misc]
+
+    seconds_task = Task(name="timed", scenes=[scene], scorer="success_at_end", max_seconds=1.01)
+    assert seconds_task.resolve_envelope(10.0) == TaskEnvelope(name="timed", max_steps=11)
+    with pytest.raises(ConfigError, match="requires an embodiment control_hz"):
+        _ = seconds_task.envelope
+
+
+@pytest.mark.parametrize("max_steps", [True, False, 0, -1, 10.5, float("nan"), float("inf"), "80"])
+def test_task_rejects_invalid_steps_horizon(max_steps: Any) -> None:
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.scene import Scene
+    from inspect_robots.task import Task
+
+    with pytest.raises(ConfigError, match="max_steps must be >= 1"):
+        Task(
+            name="t",
+            scenes=[Scene(id="s", instruction="x")],
+            scorer="success_at_end",
+            max_steps=max_steps,
+        )
+
+
+@pytest.mark.parametrize("max_steps", [True, False, 0, -1, 10.5, float("nan"), float("inf"), "80"])
+def test_task_envelope_rejects_invalid_max_steps(max_steps: Any) -> None:
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.task import TaskEnvelope
+
+    with pytest.raises(ConfigError, match="TaskEnvelope max_steps must be an integer >= 1"):
+        TaskEnvelope(name="t", max_steps=max_steps)
+
+
+def test_task_rejects_duplicate_scene_ids() -> None:
+    # Scene ids become per-trial identity (rollout builds "{scene.id}-e{epoch}",
+    # which FrameStore turns into a filename), so a duplicate silently
+    # overwrites another trial's stored frames (#289).
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.scene import Scene
+    from inspect_robots.task import Task
+
+    with pytest.raises(ConfigError, match="duplicate scene id 'same'"):
+        Task(
+            name="t",
+            scenes=[Scene(id="same", instruction="x"), Scene(id="same", instruction="y")],
+            scorer="success_at_end",
+            max_steps=80,
+        )
+
+
+@pytest.mark.parametrize("max_seconds", [True, 0.0, -1.0, float("nan"), float("inf")])
+def test_task_rejects_invalid_seconds_horizon(max_seconds: float) -> None:
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.scene import Scene
+    from inspect_robots.task import Task
+
+    with pytest.raises(ConfigError, match="max_seconds must be finite and > 0"):
+        Task(
+            name="timed",
+            scenes=[Scene(id="s", instruction="x")],
+            scorer="success_at_end",
+            max_seconds=max_seconds,
+        )
+
+
+@pytest.mark.parametrize("control_hz", [None, True, 0.0, -1.0, float("nan"), float("inf")])
+def test_seconds_horizon_rejects_invalid_control_rate(control_hz: float | None) -> None:
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.scene import Scene
+    from inspect_robots.task import Task
+
+    task = Task(
+        name="timed",
+        scenes=[Scene(id="s", instruction="x")],
+        scorer="success_at_end",
+        max_seconds=120.0,
+    )
+    with pytest.raises(ConfigError, match="control_hz"):
+        task.resolve_envelope(control_hz)
+
+
+def test_seconds_horizon_rejects_nonfinite_resolved_budget() -> None:
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.scene import Scene
+    from inspect_robots.task import Task
+
+    task = Task(
+        name="timed",
+        scenes=[Scene(id="s", instruction="x")],
+        scorer="success_at_end",
+        max_seconds=1e308,
+    )
+    with pytest.raises(ConfigError, match="finite step budget"):
+        task.resolve_envelope(1e308)
+
+
+def test_seconds_horizon_underflow_still_resolves_to_one_step() -> None:
+    from inspect_robots.scene import Scene
+    from inspect_robots.task import Task, TaskEnvelope
+
+    task = Task(
+        name="timed",
+        scenes=[Scene(id="s", instruction="x")],
+        scorer="success_at_end",
+        max_seconds=5e-324,
+    )
+    assert task.resolve_envelope(0.5) == TaskEnvelope(name="timed", max_steps=1)
 
 
 def test_task_validation_and_scorer_names() -> None:
@@ -143,12 +320,31 @@ def test_task_validation_and_scorer_names() -> None:
     from inspect_robots.task import Epochs, Task
 
     scene = Scene(id="s", instruction="x")
+    with pytest.raises(ConfigError, match="exactly one"):
+        Task(name="t", scenes=[scene], scorer="success_at_end")
+    with pytest.raises(ConfigError, match="exactly one"):
+        Task(
+            name="t",
+            scenes=[scene],
+            scorer="success_at_end",
+            max_steps=5,
+            max_seconds=1.0,
+        )
     with pytest.raises(ConfigError, match="max_steps"):
         Task(name="t", scenes=[scene], scorer="success_at_end", max_steps=0)
     with pytest.raises(ConfigError, match="Epochs count"):
         Task(name="t", scenes=[scene], scorer="success_at_end", max_steps=5, epochs=0)
-    with pytest.raises(ConfigError, match="Epochs count"):
-        Epochs(count=0)
+    for invalid_count in (0, -1, True, False, 2.5, "1"):
+        with pytest.raises(ConfigError, match="Epochs count"):
+            Epochs(count=invalid_count)  # type: ignore[arg-type]
+        with pytest.raises(ConfigError, match="Epochs count"):
+            Task(
+                name="t",
+                scenes=[scene],
+                scorer="success_at_end",
+                max_steps=5,
+                epochs=invalid_count,  # type: ignore[arg-type]
+            )
 
     # A scorer registry name resolves to one scorer, never to a sequence of
     # one-character "scorers" (str is a Sequence).
@@ -161,3 +357,11 @@ def test_task_validation_and_scorer_names() -> None:
 
     mixed = Task(name="t", scenes=[scene], scorer=[episode_length(), "success_at_end"], max_steps=5)
     assert [s.name for s in mixed.scorers] == ["episode_length", "success_at_end"]
+
+
+def test_operator_end_constant_is_public_vocabulary() -> None:
+    import inspect_robots
+    from inspect_robots.types import OPERATOR_END
+
+    assert OPERATOR_END == "operator_end"
+    assert inspect_robots.OPERATOR_END is OPERATOR_END

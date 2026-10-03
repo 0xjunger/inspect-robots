@@ -3,16 +3,27 @@
 from __future__ import annotations
 
 import configparser
+import math
 import os
 import re
 import struct
+import sys
+from collections import Counter
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import IO
 
-from inspect_robots._defaults import _config_path, parse_value
-from inspect_robots.conformance import DeviceSlot, device_slots
+from inspect_robots.conformance import (
+    DeviceSlot,
+    NumberSlot,
+    OptionSlot,
+    device_slots,
+    number_slots,
+    option_slots,
+)
+from inspect_robots.defaults import _parse_value, config_path
 
 # Same minimal-ANSI convention as cli.py (#37): plain when piped or NO_COLOR.
 _BOLD = "1"
@@ -45,8 +56,13 @@ CAM_ROLES: tuple[str, ...] = ("top", "left", "right")  # -> {role}_cam_device in
 CAMERA_KEYS: tuple[str, ...] = tuple(f"{role}_cam_device" for role in CAM_ROLES)
 V4L_BY_ID: Path = Path("/dev/v4l/by-id")
 V4L_BY_PATH: Path = Path("/dev/v4l/by-path")
+SYSFS_VIDEO: Path = Path("/sys/class/video4linux")
 SYSFS_NET: Path = Path("/sys/class/net")
 SERIAL_BY_ID: Path = Path("/dev/serial/by-id")
+_NOUNS: dict[str, tuple[str, str, str]] = {
+    "can": ("CAN interface", "CAN interfaces", "CAN interface"),
+    "serial": ("serial device", "serial devices", "serial device"),
+}
 
 # Kernel V4L2 ABI: ioctl request numbers and the byte offsets used below
 # (capabilities at 84 in struct v4l2_capability, pixelformat at 44 in
@@ -101,12 +117,16 @@ def _valid_text(_value: str) -> bool:
 
 
 def _valid_max_steps(value: str) -> bool:
-    parsed = parse_value(value)
+    parsed = _parse_value(value)
     return isinstance(parsed, int) and not isinstance(parsed, bool) and parsed >= 1
 
 
 def _valid_bool(value: str) -> bool:
-    return isinstance(parse_value(value), bool)
+    return isinstance(_parse_value(value), bool)
+
+
+def _valid_images_mode(value: str) -> bool:
+    return value in ("on_demand", "always")
 
 
 def _ask(
@@ -210,6 +230,7 @@ def _prompt_defaults(
                 _paint(
                     "no display detected (SSH?): the rerun viewer cannot open here; "
                     "use --rerun-connect to stream to a viewer on another machine; "
+                    "use --rerun-save to keep a replayable .rrd without a local viewer; "
                     "frames still record with store_frames",
                     _YELLOW,
                     out,
@@ -246,6 +267,17 @@ def _print_camera_listing(devices: list[str], directory: Path, out: IO[str]) -> 
         print(f"  {number}. {Path(device).name}", file=out)
 
 
+def _print_unverified_camera_hint(devices: list[str], out: IO[str]) -> None:
+    """Say when the listing is the unfiltered fallback because no node probed color-capable."""
+    if not devices:
+        return
+    message = (
+        "could not confirm which nodes are color cameras (probe inconclusive), "
+        "so every device is listed; some may be metadata-only nodes"
+    )
+    print(_paint(message, _YELLOW, out), file=out)
+
+
 def _print_camera_path_hint(
     by_id_devices: list[str],
     by_path_devices: list[str],
@@ -272,9 +304,51 @@ def _print_camera_path_hint(
     print(_paint(message, _YELLOW, out), file=out)
 
 
+def _print_camera_name_hint(
+    inventory: list[_CameraNode], active_is_by_id: bool, out: IO[str]
+) -> None:
+    """Explain fallback rows: cameras whose by-id name is missing or ambiguous."""
+    ambiguous = _ambiguous_identities(inventory)
+    fallback = [
+        record for record in inventory if record.by_id is None or _is_ambiguous(record, ambiguous)
+    ]
+    if not fallback:
+        return
+    names = ", ".join(Path(record.by_path or record.node).name for record in fallback)
+    message = (
+        f"{len(fallback)} camera node(s) have no usable by-id entry "
+        "(udev name race between USB interfaces, duplicate serials, or "
+        f"same-model cameras with missing serials): {names}; by-path names, "
+        "stable per physical USB port, are used where available"
+    )
+    if active_is_by_id:
+        message += "; press 'p' to see every camera by port name"
+    print(_paint(message, _YELLOW, out), file=out)
+
+
+def _camera_view_state(
+    inventory: list[_CameraNode], by_id_rows: list[str], by_path_rows: list[str]
+) -> tuple[bool, bool]:
+    """Return the initial listing view and whether to advertise the 'p' toggle.
+
+    Non-empty inventory starts in the by-id view when any camera has a by-id
+    name (else port view), and advertises 'p' exactly when some camera's by-id
+    name is missing or ambiguous. Empty inventory uses the historical formulas.
+    """
+    if inventory:
+        ambiguous = _ambiguous_identities(inventory)
+        active_is_by_id = any(record.by_id for record in inventory) or not any(
+            record.by_path for record in inventory
+        )
+        advertise_path_toggle = any(
+            record.by_id is None or _is_ambiguous(record, ambiguous) for record in inventory
+        )
+        return active_is_by_id, advertise_path_toggle
+    return bool(by_id_rows) or not by_path_rows, len(by_path_rows) > len(by_id_rows)
+
+
 def _identify_by_replug(
     role: str,
-    devices: list[str],
     *,
     input_fn: Callable[[str], str],
     out: IO[str],
@@ -284,7 +358,8 @@ def _identify_by_replug(
     retry_noun: str = "camera",
     unplug_label: str | None = None,
 ) -> str | None:
-    """Identify one device by diffing the listing while it is unplugged."""
+    """Identify one device using a fresh listing diff while it is unplugged."""
+    devices = rescan()
     label = unplug_label if unplug_label is not None else f"{role} camera"
     input_fn(f"Unplug the {label} now, then press Enter...")
     unplugged_devices = rescan()
@@ -322,6 +397,119 @@ def _identify_by_replug(
     return identified
 
 
+def _identify_camera_by_replug(
+    role: str,
+    *,
+    input_fn: Callable[[str], str],
+    out: IO[str],
+    rescan: Callable[[], list[_CameraNode]],
+    prefer_by_id: bool,
+    by_id_dir: Path,
+    by_path_dir: Path,
+    unplug_label: str | None = None,
+) -> str | None:
+    """Identify one physical camera by diffing USB devices while unplugged.
+
+    Diffs cameras (sysfs USB device, falling back to the resolved node)
+    rather than listing rows, so a camera invisible in the by-id view or
+    duplicated by by-path aliases is still identified by a single unplug.
+    The stored name is re-derived from the post-replug scan because udev
+    re-rolls symlinks on every plug event. With an empty inventory (no node
+    probed color-capable: non-Linux, or probing unavailable) the legacy
+    row-diff flow runs instead, over the active directory's raw listing.
+    """
+
+    def grouped(inventory: list[_CameraNode]) -> dict[str, list[_CameraNode]]:
+        cameras: dict[str, list[_CameraNode]] = {}
+        for record in inventory:
+            cameras.setdefault(record.camera or record.node, []).append(record)
+        return cameras
+
+    def name_of(cameras: dict[str, list[_CameraNode]], key: str) -> str:
+        flat = [record for records in cameras.values() for record in records]
+        return _preferred_name(cameras[key], _ambiguous_identities(flat), prefer_by_id=prefer_by_id)
+
+    before_inventory = rescan()
+    if not before_inventory:
+        directory = by_id_dir if prefer_by_id else by_path_dir
+        return _identify_by_replug(
+            role,
+            input_fn=input_fn,
+            out=out,
+            rescan=lambda: _camera_rows(rescan(), directory, by_id=prefer_by_id),
+            unplug_label=unplug_label,
+        )
+
+    label = unplug_label if unplug_label is not None else f"{role} camera"
+    before = grouped(before_inventory)
+    input_fn(f"Unplug the {label} now, then press Enter...")
+    after = grouped(rescan())
+    gone = [key for key in before if key not in after]
+    if not gone:
+        print(
+            _paint("no camera disappeared; unplug one camera and try again", _YELLOW, out),
+            file=out,
+        )
+        return None
+    if len(gone) > 1:
+        print(
+            _paint(
+                f"{len(gone)} cameras disappeared; unplug only one and try again",
+                _YELLOW,
+                out,
+            ),
+            file=out,
+        )
+        return None
+
+    key = gone[0]
+    display = Path(name_of(before, key)).name
+    print(f"That was: {_paint(display, _GREEN, out)}", file=out)
+    input_fn("Plug it back in, then press Enter...")
+    final = grouped(rescan())
+    if key not in final:
+        input_fn(f"{display} was not detected; press Enter to rescan...")
+        final = grouped(rescan())
+    if key not in final:
+        print(
+            _paint(
+                f"warning: {display} was still not detected; keeping the assignment",
+                _YELLOW,
+                out,
+            ),
+            file=out,
+        )
+        return name_of(before, key)
+    return name_of(final, key)
+
+
+def _camera_identify(
+    role: str,
+    unplug_label: str | None,
+    *,
+    input_fn: Callable[[str], str],
+    out: IO[str],
+    rescan: Callable[[], list[_CameraNode]],
+    by_id_dir: Path,
+    by_path_dir: Path,
+) -> Callable[[bool], str | None]:
+    """Bind one camera slot's 'u' handler over the shared inventory rescan."""
+
+    def identify(prefer_by_id: bool) -> str | None:
+        return _identify_camera_by_replug(
+            role,
+            input_fn=input_fn,
+            out=out,
+            rescan=rescan,
+            prefer_by_id=prefer_by_id,
+            by_id_dir=by_id_dir,
+            by_path_dir=by_path_dir,
+            unplug_label=unplug_label,
+        )
+
+    return identify
+
+
 def _device_slot_prompt(
     label: str,
     kind: str,
@@ -356,11 +544,11 @@ def _prompt_device_slot(
     current: str | None,
     assigned: dict[str, tuple[str, str, str]],
     advertise_path_toggle: bool,
+    inventory: list[_CameraNode],
     *,
     input_fn: Callable[[str], str],
     out: IO[str],
-    rescan_by_id: Callable[[], list[str]],
-    rescan_by_path: Callable[[], list[str]],
+    identify: Callable[[bool], str | None],
     camera_role: str | None = None,
 ) -> tuple[str | None, bool]:
     """Prompt for one slot and return its device plus active listing state."""
@@ -388,22 +576,7 @@ def _prompt_device_slot(
             _print_camera_listing(devices, device_dir, out)
             continue
         if entered.lower() == "u":
-            nouns = {
-                "v4l2": ("camera device", "camera devices", "camera"),
-                "can": ("CAN interface", "CAN interfaces", "CAN interface"),
-                "serial": ("serial device", "serial devices", "serial device"),
-            }
-            selected = _identify_by_replug(
-                camera_role or label,
-                devices,
-                input_fn=input_fn,
-                out=out,
-                rescan=rescan_by_id if active_is_by_id else rescan_by_path,
-                noun=nouns[kind][0],
-                plural_noun=nouns[kind][1],
-                retry_noun=nouns[kind][2],
-                unplug_label=None if camera_role is not None else label,
-            )
+            selected = identify(active_is_by_id)
             if selected is None:
                 continue
         elif not entered and current is not None:
@@ -426,6 +599,19 @@ def _prompt_device_slot(
                     )
                 if warning is not None:
                     print(_paint(warning, _YELLOW, out), file=out)
+                    replacement = _reconcile_missing_current(
+                        current, inventory, prefer_by_id=active_is_by_id
+                    )
+                    if replacement is not None:
+                        print(
+                            _paint(
+                                "a camera with that serial is connected; its "
+                                f"stable path is now {replacement}",
+                                _YELLOW,
+                                out,
+                            ),
+                            file=out,
+                        )
                     warned_current = True
                     continue
             selected = current
@@ -471,6 +657,51 @@ def _prompt_device_slot(
             )
             continue
 
+        ambiguous = _ambiguous_identities(inventory)
+        selected_path = Path(selected)
+        selected_is_by_id = selected_path.parent.resolve(strict=False) == by_id_dir.resolve(
+            strict=False
+        )
+        selected_node = selected_path.resolve(strict=False)
+        ambiguous_record = next(
+            (
+                record
+                for record in inventory
+                if _is_ambiguous(record, ambiguous)
+                and (
+                    record.by_id == selected
+                    or (selected_is_by_id and selected_node == Path(record.node))
+                )
+            ),
+            None,
+        )
+        if ambiguous_record is not None:
+            identity = (ambiguous_record.model, ambiguous_record.serial)
+            claimants_by_camera: dict[str, str] = {}
+            for record in inventory:
+                if (record.model, record.serial) == identity or (
+                    ambiguous_record.serial is not None and record.serial == ambiguous_record.serial
+                ):
+                    claimants_by_camera.setdefault(
+                        record.camera or record.node,
+                        Path(record.by_path or record.node).name,
+                    )
+            claimants = sorted(claimants_by_camera.values())
+            names = ", ".join(claimants)
+            print(
+                _paint(
+                    f"cannot use ambiguous by-id camera name {selected}; "
+                    f"choose one of these claimant cameras by port: {names}; "
+                    "enter its number from the listing",
+                    _YELLOW,
+                    out,
+                ),
+                file=out,
+            )
+            # A dangling by-id alias remains out of scope because it cannot
+            # resolve to an inventory node.
+            continue
+
         other = next(
             (
                 (assigned_label, device)
@@ -509,17 +740,21 @@ def _camera_section(
     carried: dict[str, dict[str, str]],
     by_id_dir: Path,
     by_path_dir: Path,
+    sysfs_video: Path,
     *,
     input_fn: Callable[[str], str],
     out: IO[str],
 ) -> dict[str, str]:
     """Offer and collect camera assignments from both stable V4L listings."""
-    by_id_devices = _scan_cameras(by_id_dir)
-    by_path_devices = _scan_cameras(by_path_dir)
-    active_is_by_id = bool(by_id_devices) or not by_path_devices
+    inventory = _camera_inventory(by_id_dir, by_path_dir, sysfs_video)
+    by_id_devices = _camera_rows(inventory, by_id_dir, by_id=True)
+    by_path_devices = _camera_rows(inventory, by_path_dir, by_id=False)
+    active_is_by_id, advertise_path_toggle = _camera_view_state(
+        inventory, by_id_devices, by_path_devices
+    )
+    rescan_inventory = partial(_camera_inventory, by_id_dir, by_path_dir, sysfs_video)
     devices = by_id_devices if active_is_by_id else by_path_devices
     device_dir = by_id_dir if active_is_by_id else by_path_dir
-    advertise_path_toggle = len(by_path_devices) > len(by_id_devices)
 
     existing_args = carried.get("embodiment.args", {})
     default_enabled = bool(devices) or any(key in existing_args for key in CAMERA_KEYS)
@@ -533,7 +768,11 @@ def _camera_section(
             _paint("no /dev/v4l devices found (not Linux, or no cameras attached)", _YELLOW, out),
             file=out,
         )
-    _print_camera_path_hint(by_id_devices, by_path_devices, active_is_by_id, out)
+    if inventory:
+        _print_camera_name_hint(inventory, active_is_by_id, out)
+    else:
+        _print_unverified_camera_hint(by_id_devices or by_path_devices, out)
+        _print_camera_path_hint(by_id_devices, by_path_devices, active_is_by_id, out)
 
     while True:
         assignments: dict[str, str] = {}
@@ -551,10 +790,18 @@ def _camera_section(
                 existing_args.get(key),
                 assigned_devices,
                 advertise_path_toggle,
+                inventory,
                 input_fn=input_fn,
                 out=out,
-                rescan_by_id=partial(_scan_cameras, by_id_dir),
-                rescan_by_path=partial(_scan_cameras, by_path_dir),
+                identify=_camera_identify(
+                    role,
+                    None,
+                    input_fn=input_fn,
+                    out=out,
+                    rescan=rescan_inventory,
+                    by_id_dir=by_id_dir,
+                    by_path_dir=by_path_dir,
+                ),
                 camera_role=role,
             )
             if selected is not None:
@@ -611,18 +858,22 @@ def _device_section(
     by_path_dir: Path,
     sysfs_net: Path,
     serial_by_id_dir: Path,
+    sysfs_video: Path,
     *,
     input_fn: Callable[[str], str],
     out: IO[str],
 ) -> dict[str, str]:
     """Offer and collect assignments for plugin-declared device slots."""
     kinds = {slot.kind for slot in slots}
-    by_id_devices = _scan_cameras(by_id_dir) if "v4l2" in kinds else []
-    by_path_devices = _scan_cameras(by_path_dir) if "v4l2" in kinds else []
+    inventory = _camera_inventory(by_id_dir, by_path_dir, sysfs_video) if "v4l2" in kinds else []
+    by_id_devices = _camera_rows(inventory, by_id_dir, by_id=True) if "v4l2" in kinds else []
+    by_path_devices = _camera_rows(inventory, by_path_dir, by_id=False) if "v4l2" in kinds else []
     can_devices = _scan_can(sysfs_net) if "can" in kinds else []
     serial_devices = _scan_serial(serial_by_id_dir) if "serial" in kinds else []
-    active_is_by_id = bool(by_id_devices) or not by_path_devices
-    advertise_path_toggle = len(by_path_devices) > len(by_id_devices)
+    active_is_by_id, advertise_path_toggle = _camera_view_state(
+        inventory, by_id_devices, by_path_devices
+    )
+    rescan_inventory = partial(_camera_inventory, by_id_dir, by_path_dir, sysfs_video)
     devices_by_kind = {
         "v4l2": by_id_devices if active_is_by_id else by_path_devices,
         "can": can_devices,
@@ -649,26 +900,56 @@ def _device_section(
             secondary_dir = by_path_dir
             current_devices = primary_devices if active_is_by_id else secondary_devices
             current_dir = primary_dir if active_is_by_id else secondary_dir
-            rescan_primary = partial(_scan_cameras, primary_dir)
-            rescan_secondary = partial(_scan_cameras, secondary_dir)
         elif slot.kind == "can":
             primary_devices = secondary_devices = can_devices
             primary_dir = secondary_dir = SYSFS_NET
             current_devices = can_devices
             current_dir = SYSFS_NET
-            rescan_primary = rescan_secondary = partial(_scan_can, sysfs_net)
+            rescan_primary = partial(_scan_can, sysfs_net)
         else:
             primary_devices = secondary_devices = serial_devices
             primary_dir = secondary_dir = SERIAL_BY_ID
             current_devices = serial_devices
             current_dir = SERIAL_BY_ID
-            rescan_primary = rescan_secondary = partial(_scan_serial, serial_by_id_dir)
+            rescan_primary = partial(_scan_serial, serial_by_id_dir)
 
         if slot.kind not in listed_kinds:
             _print_slot_listing(slot.kind, current_devices, current_dir, out)
             listed_kinds.add(slot.kind)
             if slot.kind == "v4l2":
-                _print_camera_path_hint(by_id_devices, by_path_devices, active_is_by_id, out)
+                if inventory:
+                    _print_camera_name_hint(inventory, active_is_by_id, out)
+                else:
+                    _print_unverified_camera_hint(by_id_devices or by_path_devices, out)
+                    _print_camera_path_hint(by_id_devices, by_path_devices, active_is_by_id, out)
+
+        identify: Callable[[bool], str | None]
+        if slot.kind == "v4l2":
+            identify = _camera_identify(
+                slot.label,
+                slot.label,
+                input_fn=input_fn,
+                out=out,
+                rescan=rescan_inventory,
+                by_id_dir=by_id_dir,
+                by_path_dir=by_path_dir,
+            )
+        else:
+            noun, plural_noun, retry_noun = _NOUNS[slot.kind]
+
+            def _identify(_prefer_by_id: bool) -> str | None:
+                return _identify_by_replug(
+                    slot.label,
+                    input_fn=input_fn,
+                    out=out,
+                    rescan=rescan_primary,
+                    noun=noun,
+                    plural_noun=plural_noun,
+                    retry_noun=retry_noun,
+                    unplug_label=slot.label,
+                )
+
+            identify = _identify
 
         selected, active_is_by_id = _prompt_device_slot(
             slot.label,
@@ -681,10 +962,10 @@ def _device_section(
             existing_args.get(slot.arg),
             assigned_devices,
             advertise_path_toggle,
+            inventory if slot.kind == "v4l2" else [],
             input_fn=input_fn,
             out=out,
-            rescan_by_id=rescan_primary,
-            rescan_by_path=rescan_secondary,
+            identify=identify,
         )
         assignments.pop(slot.arg, None)
         assigned_devices.pop(slot.arg, None)
@@ -720,6 +1001,98 @@ def _device_section(
                 assigned_devices.pop(slot.arg, None)
                 prompt_slot(slot)
     return assignments
+
+
+def _options_section(
+    options: tuple[OptionSlot, ...],
+    carried: dict[str, dict[str, str]],
+    *,
+    input_fn: Callable[[str], str],
+    out: IO[str],
+) -> dict[str, str]:
+    """Interview plugin-declared behavior toggles as yes/no questions.
+
+    The carried config value (parsed as a bool) is the suggested answer when
+    present and boolean; otherwise the slot's declared default. Answers are
+    written explicitly (``true``/``false``) so declining a previously enabled
+    toggle turns it off rather than silently carrying it forward.
+    """
+    existing_args = carried.get("embodiment.args", {})
+    answers: dict[str, str] = {}
+    for option in options:
+        suggested = option.default
+        if option.arg in existing_args:
+            parsed = _parse_value(existing_args[option.arg])
+            if isinstance(parsed, bool):
+                suggested = parsed
+        enabled = _ask_yes_no(option.label, suggested, input_fn=input_fn, out=out)
+        answers[option.arg] = "true" if enabled else "false"
+    return answers
+
+
+def _acceptable_number(slot: NumberSlot, parsed: object) -> bool:
+    if parsed is None:
+        return slot.allow_none
+    if not isinstance(parsed, (float, int)) or isinstance(parsed, bool):
+        return False
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        return False
+    if slot.minimum is not None and parsed < slot.minimum:
+        return False
+    return slot.maximum is None or parsed <= slot.maximum
+
+
+def _number_validator(slot: NumberSlot) -> _Validator:
+    def validate(value: str) -> bool:
+        return _acceptable_number(slot, _parse_value(value))
+
+    return validate
+
+
+def _number_constraint(slot: NumberSlot) -> str:
+    constraint = f"{slot.arg} must be a finite number"
+    if slot.minimum is not None:
+        constraint += f" >= {slot.minimum}"
+    if slot.maximum is not None:
+        conjunction = " and" if slot.minimum is not None else ""
+        constraint += f"{conjunction} <= {slot.maximum}"
+    if slot.allow_none:
+        constraint += ", or none"
+    return constraint
+
+
+def _numbers_section(
+    numbers: tuple[NumberSlot, ...],
+    carried: dict[str, dict[str, str]],
+    *,
+    input_fn: Callable[[str], str],
+    out: IO[str],
+) -> dict[str, str]:
+    """Interview plugin-declared finite numeric settings within their bounds.
+
+    A valid carried value supplies the suggestion; otherwise the declared
+    default is used silently. Accepted input is preserved verbatim, while
+    Enter writes the displayed default and ``None`` is canonicalized to
+    ``none``.
+    """
+    existing_args = carried.get("embodiment.args", {})
+    answers: dict[str, str] = {}
+    for slot in numbers:
+        suggested = slot.default
+        if slot.arg in existing_args:
+            parsed = _parse_value(existing_args[slot.arg])
+            if _acceptable_number(slot, parsed):
+                suggested = parsed
+        display = "none" if suggested is None else str(suggested)
+        answers[slot.arg] = _ask(
+            slot.label,
+            display,
+            _number_validator(slot),
+            _number_constraint(slot),
+            input_fn=input_fn,
+            out=out,
+        )
+    return answers
 
 
 def _v4l2_color_capture(path: Path) -> bool | None:
@@ -763,14 +1136,217 @@ def _v4l2_color_capture(path: Path) -> bool | None:
         os.close(fd)
 
 
-def _scan_cameras(v4l_dir: Path) -> list[str]:
-    """Return V4L2-probed color paths, or all sorted entries when none are confirmed."""
+_USB_SPEED_ALIAS = re.compile(r"-usbv\d+-")
+
+
+@dataclass(frozen=True)
+class _CameraNode:
+    """One color-capable camera node and every name that reaches it.
+
+    ``node`` is the resolved real device path and the diffing identity when
+    sysfs cannot group nodes into physical cameras; ``camera`` is the sysfs
+    USB device directory owning the node (one per physical camera) or
+    ``None`` where sysfs is unavailable; ``serial`` is the USB serial when
+    readable; ``by_id``/``by_path`` are the preferred symlinks resolving to
+    the node in each listing directory, when any exist; ``model`` is the
+    stable udev-name proxy ``idVendor:idProduct`` when both values are readable.
+    """
+
+    node: str
+    camera: str | None
+    serial: str | None
+    by_id: str | None
+    by_path: str | None
+    model: str | None = None
+
+
+def _usb_device_dir(node_name: str, sysfs_video: Path) -> Path | None:
+    """Sysfs USB device directory owning a video node, if resolvable.
+
+    Walks from ``<sysfs_video>/<node>/device`` up to the first ancestor
+    holding an ``idVendor`` file, the USB device (not interface) dir,
+    which is the physical-camera identity shared by all the device's nodes.
+    """
     try:
-        entries = sorted(v4l_dir.iterdir())
-    except FileNotFoundError:
+        device = (sysfs_video / node_name / "device").resolve(strict=True)
+    except OSError:
+        return None
+    for ancestor in (device, *device.parents):
+        if (ancestor / "idVendor").is_file():
+            return ancestor
+    return None
+
+
+def _prefer_plain_alias(candidates: list[Path]) -> Path:
+    """Return the canonical name among symlinks to one node.
+
+    Newer systemd publishes ``usbv2-``/``usbv3-`` speed-qualified aliases
+    next to the plain ``usb-`` by-path name; prefer the plain name, then
+    tie-break lexicographically for determinism.
+    """
+
+    def rank(path: Path) -> tuple[bool, str]:
+        return bool(_USB_SPEED_ALIAS.search(path.name)), path.name
+
+    return min(candidates, key=rank)
+
+
+def _camera_inventory(by_id_dir: Path, by_path_dir: Path, sysfs_video: Path) -> list[_CameraNode]:
+    """Return color-capable camera nodes with physical identity and names.
+
+    Symlinks from both listing directories are resolved and grouped by
+    target, each target is probed once, and each color-capable target
+    becomes one record. Grouping by resolved target rather than by name is
+    what lets udev alias duplicates and missing by-id links be survivable.
+    """
+    names: dict[Path, dict[str, list[Path]]] = {}
+    for directory, kind in ((by_id_dir, "by_id"), (by_path_dir, "by_path")):
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            target = entry.resolve(strict=False)
+            names.setdefault(target, {"by_id": [], "by_path": []})[kind].append(entry)
+    records: list[_CameraNode] = []
+    for target in sorted(names):
+        if _v4l2_color_capture(target) is not True:
+            continue
+        usb_dir = _usb_device_dir(target.name, sysfs_video)
+        serial: str | None = None
+        model: str | None = None
+        if usb_dir is not None:
+            try:
+                serial = (usb_dir / "serial").read_text(encoding="utf-8").strip() or None
+            except (OSError, UnicodeDecodeError):
+                serial = None
+            try:
+                vendor = (usb_dir / "idVendor").read_text(encoding="utf-8").strip() or None
+                product = (usb_dir / "idProduct").read_text(encoding="utf-8").strip() or None
+                model = (
+                    f"{vendor}:{product}" if vendor is not None and product is not None else None
+                )
+            except (OSError, UnicodeDecodeError):
+                model = None
+        by_id = names[target]["by_id"]
+        by_path = names[target]["by_path"]
+        records.append(
+            _CameraNode(
+                node=str(target),
+                camera=None if usb_dir is None else str(usb_dir),
+                serial=serial,
+                by_id=str(_prefer_plain_alias(by_id)) if by_id else None,
+                by_path=str(_prefer_plain_alias(by_path)) if by_path else None,
+                model=model,
+            )
+        )
+    return records
+
+
+def _ambiguous_identities(
+    inventory: list[_CameraNode],
+) -> set[tuple[str | None, str | None]]:
+    """Return by-id identities claimable by more than one physical camera.
+
+    Cameras sharing a model and an empty serial can overwrite the same by-id
+    link on every replug. A duplicated non-empty serial remains ambiguous
+    across models. Records with no model and no serial are unknown rather than
+    shared identities.
+    """
+    per_camera = {record.camera or record.node: record for record in inventory}
+    identity_counts = Counter((record.model, record.serial) for record in per_camera.values())
+    serial_counts = Counter(
+        record.serial for record in per_camera.values() if record.serial is not None
+    )
+    ambiguous = {
+        identity
+        for identity, count in identity_counts.items()
+        if identity != (None, None) and count > 1
+    }
+    duplicated_serials = {serial for serial, count in serial_counts.items() if count > 1}
+    ambiguous.update(
+        (record.model, record.serial)
+        for record in per_camera.values()
+        if record.serial in duplicated_serials
+    )
+    return ambiguous
+
+
+def _is_ambiguous(record: _CameraNode, ambiguous: set[tuple[str | None, str | None]]) -> bool:
+    """Return whether a camera record carries an ambiguous by-id identity."""
+    return (record.model, record.serial) in ambiguous
+
+
+def _preferred_name(
+    records: list[_CameraNode],
+    ambiguous: set[tuple[str | None, str | None]],
+    *,
+    prefer_by_id: bool,
+) -> str:
+    """Return the trust-ladder name for one camera's color nodes.
+
+    Ladder: an unambiguous by-id name (it survives port moves), else the plain
+    by-path name (stable per physical USB port), else the raw node path.
+    ``prefer_by_id=False`` (the 'p' port-name view) skips the first rung.
+    """
+    ranked: list[tuple[int, str]] = []
+    for record in records:
+        by_id = record.by_id
+        trusted = by_id is not None and not _is_ambiguous(record, ambiguous)
+        # The explicit by_id check narrows the optional string for mypy.
+        if prefer_by_id and by_id is not None and trusted:
+            ranked.append((0, by_id))
+        elif record.by_path is not None:
+            ranked.append((1, record.by_path))
+        else:
+            ranked.append((2, record.node))
+    return min(ranked)[1]
+
+
+def _camera_rows(inventory: list[_CameraNode], directory: Path, *, by_id: bool) -> list[str]:
+    """Return listing rows for one view, one per color-capable node.
+
+    Every camera is always listed: a node whose by-id link is missing or
+    ambiguous shows its port-stable by-path name instead of vanishing. When
+    no color-capable node is confirmed at all (non-Linux, or probing
+    unavailable) the raw directory listing is offered unfiltered, matching
+    the historical ``_scan_cameras`` fallback.
+    """
+    ambiguous = _ambiguous_identities(inventory)
+    rows = sorted(
+        {_preferred_name([record], ambiguous, prefer_by_id=by_id) for record in inventory}
+    )
+    if rows:
+        return rows
+    try:
+        return [str(entry) for entry in sorted(directory.iterdir())]
+    except OSError:
         return []
-    color_entries = [entry for entry in entries if _v4l2_color_capture(entry) is True]
-    return [str(entry) for entry in color_entries or entries]
+
+
+_BY_ID_SERIAL = re.compile(r"_([A-Za-z0-9]+)-video-index\d+$")
+
+
+def _reconcile_missing_current(
+    current: str, inventory: list[_CameraNode], *, prefer_by_id: bool
+) -> str | None:
+    """Return the scanned camera matching a dead by-id name's embedded serial.
+
+    udev by-id names end ``_<serial>-video-index<n>``; when the saved link
+    is gone but a camera with that serial is on the bus, the operator should
+    be told where it lives now instead of just "not detected".
+    """
+    match = _BY_ID_SERIAL.search(Path(current).name)
+    if match is None:
+        return None
+    serial = match.group(1)
+    records = [record for record in inventory if record.serial == serial]
+    if not records:
+        return None
+    if len({record.camera or record.node for record in records}) > 1:
+        # Two cameras carry this serial: pointing at either would be a guess.
+        return None
+    return _preferred_name(records, _ambiguous_identities(inventory), prefer_by_id=prefer_by_id)
 
 
 def _scan_can(sysfs_net: Path) -> list[str]:
@@ -808,6 +1384,19 @@ def _can_serial(sysfs_net: Path, ifname: str) -> str | None:
         return None
 
 
+def _can_kernels(sysfs_net: Path, ifname: str) -> str | None:
+    """Kernel device name of a CAN interface's USB interface, if resolvable.
+
+    The name (for example ``3-2:1.0``) is what a udev ``KERNELS==`` clause
+    matches, pinning the interface to its physical USB port.
+    """
+    try:
+        return (sysfs_net / ifname / "device").resolve(strict=True).name
+    except (OSError, RuntimeError):
+        # RuntimeError: symlink loops raise it from resolve() before py3.13.
+        return None
+
+
 def _suggest_can_pinning(
     sysfs_net: Path,
     slots: tuple[DeviceSlot, ...],
@@ -815,7 +1404,10 @@ def _suggest_can_pinning(
     *,
     out: IO[str],
 ) -> None:
-    """Suggest serial-pinned udev names for assigned order-dependent CAN devices."""
+    """Suggest stable udev names for assigned order-dependent CAN devices.
+
+    Prefer serial-pinned rules, fall back to port-pinned rules, then a bare warning.
+    """
     scanned = _scan_can(sysfs_net)
     order_dependent = [ifname for ifname in scanned if re.fullmatch(r"can\d+", ifname)]
     if len(order_dependent) < 2 or not any(
@@ -833,11 +1425,6 @@ def _suggest_can_pinning(
         return
 
     warning = "these CAN interfaces have order-dependent names; a replug can swap them."
-    serials = [_can_serial(sysfs_net, ifname) for ifname in order_dependent]
-    if not all(serials) or len(set(serials)) != len(serials):
-        print(_paint(warning, _YELLOW, out), file=out)
-        return
-
     derived_names: list[str] = []
     for ifname in order_dependent:
         assigned_arg = next(
@@ -860,20 +1447,35 @@ def _suggest_can_pinning(
     if collision or any(len(name) > 15 for name in derived_names):
         derived_names = [f"can_{chr(ord('a') + index)}" for index in range(len(derived_names))]
 
-    serial_values = [serial for serial in serials if serial is not None]
-    rules = [
-        f'  SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{serial}", NAME="{name}"'
-        for serial, name in zip(serial_values, derived_names, strict=True)
-    ]
-    block = "\n".join(
-        [
+    serials = [_can_serial(sysfs_net, ifname) for ifname in order_dependent]
+    if all(serials) and len(set(serials)) == len(serials):
+        serial_values = [serial for serial in serials if serial is not None]
+        attribute_clauses = [f'ATTRS{{serial}}=="{serial}"' for serial in serial_values]
+        intro = [
             warning,
             "pin them by adapter serial (paste into /etc/udev/rules.d/70-can-names.rules,",
             "then replug or reboot), and re-run setup to record the pinned names:",
-            *rules,
         ]
-    )
-    print(_paint(block, _YELLOW, out), file=out)
+    else:
+        kernels = [_can_kernels(sysfs_net, ifname) for ifname in order_dependent]
+        if not all(kernels) or len(set(kernels)) != len(kernels):
+            print(_paint(warning, _YELLOW, out), file=out)
+            return
+        kernel_values = [kernel for kernel in kernels if kernel is not None]
+        attribute_clauses = [f'KERNELS=="{kernel}"' for kernel in kernel_values]
+        intro = [
+            warning,
+            "adapter serials are missing or shared, so pin them by USB port instead",
+            "(paste into /etc/udev/rules.d/70-can-names.rules, then replug or reboot),",
+            "and re-run setup to record the pinned names; a port-pinned name follows the",
+            "physical USB port, so keep each adapter plugged into the same port:",
+        ]
+
+    rules = [
+        f'  SUBSYSTEM=="net", ACTION=="add", {clause}, NAME="{name}"'
+        for clause, name in zip(attribute_clauses, derived_names, strict=True)
+    ]
+    print(_paint("\n".join([*intro, *rules]), _YELLOW, out), file=out)
 
 
 def _read_raw_config(path: Path) -> dict[str, dict[str, str]] | str:
@@ -895,8 +1497,12 @@ def _render_config(
     embodiment_args: dict[str, str],
     carried: dict[str, dict[str, str]],
     managed_args: tuple[str, ...] = CAMERA_KEYS,
+    policy_args: dict[str, str] | None = None,
+    managed_policy_args: tuple[str, ...] = (),
 ) -> str:
     """Render a full commented config while carrying unmanaged raw values."""
+    if policy_args is None:
+        policy_args = {}
     sections: list[str] = []
 
     default_lines: list[str] = []
@@ -931,8 +1537,20 @@ def _render_config(
     if embodiment_lines:
         sections.append("[embodiment.args]\n" + "\n".join(embodiment_lines))
 
+    policy_lines: list[str] = []
+    for key in managed_policy_args:
+        if key in policy_args:
+            value = policy_args[key].replace("\n", "\n\t")
+            policy_lines.append(f"{key} = {value}")
+    for key, value in carried.get("policy.args", {}).items():
+        if key not in managed_policy_args:
+            value = value.replace("\n", "\n\t")
+            policy_lines.append(f"{key} = {value}")
+    if policy_lines:
+        sections.append("[policy.args]\n" + "\n".join(policy_lines))
+
     for section, values in carried.items():
-        if section in ("defaults", "embodiment.args"):
+        if section in ("defaults", "embodiment.args", "policy.args"):
             continue
         if values:
             lines = []
@@ -952,6 +1570,7 @@ def run_setup(
     interactive: bool,
     by_id_dir: Path = V4L_BY_ID,
     by_path_dir: Path = V4L_BY_PATH,
+    sysfs_video: Path = SYSFS_VIDEO,
     sysfs_net: Path = SYSFS_NET,
     serial_by_id_dir: Path = SERIAL_BY_ID,
 ) -> int:
@@ -959,7 +1578,7 @@ def run_setup(
     if not interactive:
         raise SystemExit("setup is interactive; see the README for manual config")
 
-    path = _config_path(env)
+    path = config_path(env)
     if path is None:
         raise SystemExit("cannot locate a config home: set $XDG_CONFIG_HOME or $HOME")
 
@@ -1001,19 +1620,65 @@ def run_setup(
                     file=out,
                 )
 
-        headless = "DISPLAY" not in env and "WAYLAND_DISPLAY" not in env
+        # Native macOS/Windows desktops need no X11/Wayland display. SSH
+        # without a display is still headless; a forwarded display takes precedence.
+        headless = not (env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")) and (
+            sys.platform not in {"darwin", "win32"}
+            or any(env.get(key) for key in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"))
+        )
         defaults = _prompt_defaults(
             carried,
             headless=headless,
             input_fn=input_fn,
             out=out,
         )
+        configured_policy = defaults["policy"]
+        policy_args: dict[str, str] = {}
+        managed_policy_args: tuple[str, ...] = ()
+        if configured_policy == "agent":
+            managed_policy_args = ("images",)
+            existing_policy_args = carried.get("policy.args", {})
+            default_images = "on_demand"
+            if "images" in existing_policy_args:
+                configured_images = existing_policy_args["images"]
+                if _valid_images_mode(configured_images):
+                    default_images = configured_images
+            print(
+                _paint(
+                    "agent camera mode: 'on_demand' lets the model call take_pic when "
+                    "it needs a frame (cuts tokens, but model must remember to look); "
+                    "'always' attaches frames to every step",
+                    _DIM,
+                    out,
+                ),
+                file=out,
+            )
+            images_value = _ask(
+                "agent camera mode",
+                default_images,
+                _valid_images_mode,
+                "camera mode must be 'on_demand' or 'always'",
+                input_fn=input_fn,
+                out=out,
+            )
+            policy_args["images"] = images_value
+
         from inspect_robots.registry import registered
 
         embodiment_factories = registered("embodiment")
         configured_embodiment = defaults["embodiment"]
         slots = (
             device_slots(embodiment_factories[configured_embodiment])
+            if configured_embodiment in embodiment_factories
+            else ()
+        )
+        options = (
+            option_slots(embodiment_factories[configured_embodiment])
+            if configured_embodiment in embodiment_factories
+            else ()
+        )
+        numbers = (
+            number_slots(embodiment_factories[configured_embodiment])
             if configured_embodiment in embodiment_factories
             else ()
         )
@@ -1027,6 +1692,7 @@ def run_setup(
                 by_path_dir,
                 sysfs_net,
                 serial_by_id_dir,
+                sysfs_video,
                 input_fn=input_fn,
                 out=out,
             )
@@ -1037,14 +1703,52 @@ def run_setup(
                 carried,
                 by_id_dir,
                 by_path_dir,
+                sysfs_video,
                 input_fn=input_fn,
                 out=out,
+            )
+        # Options whose arg collides with an already-managed key (a device
+        # slot or camera key) or repeats an earlier option are skipped:
+        # interviewing them would write the key twice, and a duplicate key
+        # makes configparser reject the whole file on the next setup run.
+        interviewed: list[OptionSlot] = []
+        taken = set(managed_args)
+        for option in options:
+            if option.arg in taken:
+                continue
+            taken.add(option.arg)
+            interviewed.append(option)
+        if interviewed:
+            managed_args = managed_args + tuple(option.arg for option in interviewed)
+            embodiment_args.update(
+                _options_section(tuple(interviewed), carried, input_fn=input_fn, out=out)
+            )
+        # Number args share the option collision set and are interviewed last.
+        # Extending managed_args makes the answer authoritative in _render_config:
+        # the managed loop writes it and the carried-key loop drops any stale line.
+        interviewed_numbers: list[NumberSlot] = []
+        for number in numbers:
+            if number.arg in taken:
+                continue
+            taken.add(number.arg)
+            interviewed_numbers.append(number)
+        if interviewed_numbers:
+            managed_args = managed_args + tuple(number.arg for number in interviewed_numbers)
+            embodiment_args.update(
+                _numbers_section(tuple(interviewed_numbers), carried, input_fn=input_fn, out=out)
             )
     except (EOFError, KeyboardInterrupt):
         print(_paint("setup aborted; nothing written", _YELLOW, out), file=out)
         return 1
 
-    text = _render_config(defaults, embodiment_args, carried, managed_args)
+    text = _render_config(
+        defaults,
+        embodiment_args,
+        carried,
+        managed_args,
+        policy_args=policy_args,
+        managed_policy_args=managed_policy_args,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")

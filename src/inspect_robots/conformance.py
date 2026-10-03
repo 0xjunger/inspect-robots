@@ -9,24 +9,28 @@ requirements into a checkable report so adapter repos can enforce them in CI
 (one test: ``assert_embodiment_conformant(MyEmbodiment().info)``) and users
 can audit an installed adapter via ``inspect-robots doctor``.
 
-The checks are purely declarative — nothing here touches hardware — which is
-also their limit: conformance proves an adapter is *guardrail-ready and
-agent-ready*, not that its declarations are honest (a delta rig declaring
-absolute-sized per-step bounds type-checks fine). The adapter authoring
-guide covers the human half.
+``check_embodiment`` is purely declarative and touches no hardware. The
+separate, opt-in ``check_guardrail_contribution`` executes plugin code to
+validate the optional runtime contribution hook. Conformance proves an
+adapter is *guardrail-ready and agent-ready*, not that its declarations are
+honest (a delta rig declaring absolute-sized per-step bounds type-checks
+fine). The adapter authoring guide covers the human half.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
-from inspect_robots.embodiment import EmbodimentInfo
+from inspect_robots.approver import GuardrailContribution
+from inspect_robots.embodiment import Embodiment, EmbodimentInfo
+from inspect_robots.spaces import ABSOLUTE_CONTROL_MODES, Box
 
-_ABSOLUTE_MODES = frozenset({"joint_pos", "eef_abs_pose"})
 DEVICE_KINDS = ("v4l2", "can", "serial")
 
 
@@ -65,6 +69,103 @@ def device_slots(factory: object) -> tuple[DeviceSlot, ...]:
     try:
         return tuple(
             slot for slot in slots if isinstance(slot, DeviceSlot) and slot.kind in DEVICE_KINDS
+        )
+    except Exception:
+        return ()
+
+
+@dataclass(frozen=True)
+class OptionSlot:
+    """One boolean behavior toggle the setup wizard interviews.
+
+    ``arg`` is the ``[embodiment.args]`` key to write (``true``/``false``);
+    ``label`` is the yes/no question shown to the operator ("Skip the
+    operator start prompts (auto_start)"); ``default`` is the suggested
+    answer when the key is absent from an existing config.
+    """
+
+    arg: str
+    label: str
+    default: bool = False
+
+
+def option_slots(factory: object) -> tuple[OptionSlot, ...]:
+    """The declared option slots, defensively read.
+
+    Reads ``OPTION_SLOTS`` off ``factory``; anything that is not an iterable
+    of ``OptionSlot`` instances has the offending entries ignored, never
+    crashes the wizard. Returns a tuple in declaration order.
+    """
+    try:
+        slots = getattr(factory, "OPTION_SLOTS", None)
+    except Exception:
+        return ()
+    if not isinstance(slots, Iterable):
+        return ()
+    try:
+        return tuple(slot for slot in slots if isinstance(slot, OptionSlot))
+    except Exception:
+        return ()
+
+
+@dataclass(frozen=True)
+class NumberSlot:
+    """One numeric constructor argument the setup wizard interviews.
+
+    ``arg`` is the ``[embodiment.args]`` key to write and ``label`` is the
+    prompt shown to the operator, including any unit. ``default`` is the
+    suggestion when no valid carried value exists. ``minimum`` and
+    ``maximum`` are inclusive bounds; ``None`` leaves that side unbounded.
+    ``allow_none`` accepts a disabled value written as ``none``.
+    """
+
+    arg: str
+    label: str
+    default: float | int | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+    allow_none: bool = False
+
+
+def _finite_number(value: object) -> bool:
+    if not isinstance(value, (float, int)) or isinstance(value, bool):
+        return False
+    return not isinstance(value, float) or math.isfinite(value)
+
+
+def _valid_number_slot(slot: NumberSlot) -> bool:
+    if slot.minimum is not None and not _finite_number(slot.minimum):
+        return False
+    if slot.maximum is not None and not _finite_number(slot.maximum):
+        return False
+    if slot.minimum is not None and slot.maximum is not None and slot.minimum > slot.maximum:
+        return False
+    if slot.default is None:
+        return slot.allow_none
+    if not _finite_number(slot.default):
+        return False
+    if slot.minimum is not None and slot.default < slot.minimum:
+        return False
+    return slot.maximum is None or slot.default <= slot.maximum
+
+
+def number_slots(factory: object) -> tuple[NumberSlot, ...]:
+    """The declared numeric slots, defensively read.
+
+    Reads ``NUMBER_SLOTS`` off ``factory`` and returns valid ``NumberSlot``
+    instances in declaration order. Non-iterables, malformed entries,
+    non-finite or boolean numeric fields, inverted bounds, and defaults that
+    cannot pass their slot constraints are ignored without crashing setup.
+    """
+    try:
+        slots = getattr(factory, "NUMBER_SLOTS", None)
+    except Exception:
+        return ()
+    if not isinstance(slots, Iterable):
+        return ()
+    try:
+        return tuple(
+            slot for slot in slots if isinstance(slot, NumberSlot) and _valid_number_slot(slot)
         )
     except Exception:
         return ()
@@ -131,6 +232,68 @@ class ConformanceReport:
         return "\n".join(lines)
 
 
+def check_device_slots(
+    factory: object,
+    configured: Mapping[str, object],
+    *,
+    sysfs_net: Path | None = None,
+) -> list[ConformanceIssue]:
+    """Check for configured device-slot values that no longer resolve on this host.
+
+    For each ``DEVICE_SLOTS`` slot with a string value in ``configured``, return an
+    error finding when a camera or serial path does not exist or cannot be checked, or a CAN
+    interface is not present.
+
+    ``configured`` is the resolved ``[embodiment.args]``. A non-string or absent value is skipped by
+    this check. CAN validation checks presence only.
+
+    Returns findings in slot order.
+    """
+    # Lazy import because _setup imports conformance at module load.
+    from inspect_robots._setup import SYSFS_NET, _scan_can
+
+    net = SYSFS_NET if sysfs_net is None else sysfs_net
+    issues: list[ConformanceIssue] = []
+    for slot in device_slots(factory):
+        value = configured.get(slot.arg)
+        if not isinstance(value, str):
+            continue
+        if slot.kind == "can":
+            interfaces = _scan_can(net)
+            if value not in interfaces:
+                present = ", ".join(interfaces) or "none"
+                issues.append(
+                    ConformanceIssue(
+                        "error",
+                        "device",
+                        f"{slot.label} ({slot.arg}): CAN interface {value!r} not found; "
+                        f"present: {present}",
+                    )
+                )
+        else:
+            try:
+                exists = Path(value).exists()
+            except OSError as exc:
+                issues.append(
+                    ConformanceIssue(
+                        "error",
+                        "device",
+                        f"{slot.label} ({slot.arg}): {slot.kind} path {value!r} could not be "
+                        f"checked: {exc.strerror or exc}",
+                    )
+                )
+                continue
+            if not exists:
+                issues.append(
+                    ConformanceIssue(
+                        "error",
+                        "device",
+                        f"{slot.label} ({slot.arg}): {slot.kind} path {value!r} does not exist",
+                    )
+                )
+    return issues
+
+
 def check_embodiment(info: EmbodimentInfo) -> ConformanceReport:
     """Check an embodiment's declarations against the plan-0008 requirements.
 
@@ -179,7 +342,7 @@ def check_embodiment(info: EmbodimentInfo) -> ConformanceReport:
         elif len(set(labels)) != len(labels):
             error("dim_labels", "dim_labels contains duplicates")
 
-        if semantics.control_mode in _ABSOLUTE_MODES:
+        if semantics.control_mode in ABSOLUTE_CONTROL_MODES:
             spec = info.observation_space.state
             matching = [f.key for f in spec.fields if f.shape == (space.dim,)] if spec else []
             if len(matching) != 1:
@@ -212,5 +375,43 @@ def check_embodiment(info: EmbodimentInfo) -> ConformanceReport:
 def assert_embodiment_conformant(info: EmbodimentInfo) -> None:
     """Pytest-friendly wrapper: raise ``AssertionError`` with the full summary."""
     report = check_embodiment(info)
+    if not report.ok:
+        raise AssertionError(report.summary())
+
+
+def check_guardrail_contribution(embodiment: Embodiment, action_space: Box) -> ConformanceReport:
+    """Validate an optional contribution hook by executing plugin code.
+
+    An absent attribute passes. A present attribute must be callable and must
+    return ``GuardrailContribution``. Exceptions raised by the hook propagate
+    as plugin bugs. Unlike ``check_embodiment``, callers must opt in knowing
+    this check can run arbitrary adapter code.
+    """
+    missing = object()
+    hook = getattr(embodiment, "contribute_guardrails", missing)
+    if hook is missing:
+        return ConformanceReport(embodiment=embodiment.info.name)
+    if not callable(hook):
+        issue = ConformanceIssue(
+            "error",
+            "guardrail_contribution",
+            f"contribute_guardrails is not callable (got {type(hook).__name__})",
+        )
+        return ConformanceReport(embodiment=embodiment.info.name, issues=(issue,))
+    contribution = hook(action_space)
+    if not isinstance(contribution, GuardrailContribution):
+        issue = ConformanceIssue(
+            "error",
+            "guardrail_contribution",
+            f"contribute_guardrails returned {type(contribution).__name__}, "
+            "expected GuardrailContribution",
+        )
+        return ConformanceReport(embodiment=embodiment.info.name, issues=(issue,))
+    return ConformanceReport(embodiment=embodiment.info.name)
+
+
+def assert_guardrail_contribution_conformant(embodiment: Embodiment, action_space: Box) -> None:
+    """Raise ``AssertionError`` with the full contribution report on failure."""
+    report = check_guardrail_contribution(embodiment, action_space)
     if not report.ok:
         raise AssertionError(report.summary())

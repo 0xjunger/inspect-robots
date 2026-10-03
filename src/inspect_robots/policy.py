@@ -25,6 +25,7 @@ from inspect_robots.types import ActionChunk, Observation
 if TYPE_CHECKING:
     from inspect_robots.embodiment import EmbodimentInfo
     from inspect_robots.rollout import TrialRecord
+    from inspect_robots.task import TaskEnvelope
 
 
 @dataclass(frozen=True)
@@ -49,18 +50,28 @@ class PolicyInfo:
     observation_space: ObservationSpace = field(default_factory=ObservationSpace)
     # Desired control rate (Hz), if the policy was trained for a specific one.
     control_hz: float | None = None
+    # Policy checkpoint hash, revision, or identifier.
+    checkpoint: str | None = None
 
 
 @runtime_checkable
 class Policy(Protocol):
     """The VLA contract.
 
-    Policies may additionally define four optional hooks, none part of this
+    Policies may additionally define six optional hooks, none part of this
     Protocol so existing policies stay conformant. ``bind(embodiment_info)``
     lets embodiment-adaptive policies adopt the embodiment's spaces; ``eval()``
     calls it after resolving both components and before compatibility checking.
+    ``bind_task(envelope)`` lets horizon-aware policies learn the task identity
+    and step budget before rollouts start; ``eval()`` calls it before the first
+    rollout, but it never fires on a direct ``rollout()`` call, so policies must
+    keep a fallback.
+    ``on_trial_start(scene_id, epoch, log_dir, run_id)`` runs immediately before
+    each trial's rollout. It is a policy lifecycle hook, distinct from the sink
+    bus hook of the same name, which runs first and takes only scene id and epoch.
     ``on_trial_end(record, log_dir, run_id)`` runs when a trial finishes (including
-    errored and cancelled trials), before sinks see the record. Mutations to
+    errored and cancelled trials, except trials whose ``on_trial_start`` raised,
+    which never reached ``reset()``), before sinks see the record. Mutations to
     ``record.metadata`` land in the log, and exceptions degrade the run to
     status="error" rather than crashing the overall evaluation.
     ``transcript()`` returns a small JSON-serializable audit record for the
@@ -76,9 +87,9 @@ class Policy(Protocol):
     or an empty list when nothing is new. Implementations must sanitize only
     the new slice in O(new messages), including eliding image bytes before the
     result reaches visualization sinks, and ``reset()`` must rewind the cursor.
-    ``PolicyBase`` ships defaults for ``bind()`` and ``transcript()`` but
-    deliberately has no ``transcript_delta()`` default: policies must opt in so
-    every inference does not pay for a no-op hook call.
+    ``PolicyBase`` ships defaults for ``bind()``, ``bind_task()``, and
+    ``transcript()`` but deliberately has no ``transcript_delta()`` default:
+    policies must opt in so every inference does not pay for a no-op hook call.
     """
 
     info: PolicyInfo
@@ -102,12 +113,24 @@ class PolicyBase(ABC):
     def bind(self, embodiment_info: EmbodimentInfo) -> None:  # noqa: B027 - no-op default
         """Default: fixed-space policies ignore the embodiment they run on."""
 
+    def bind_task(self, envelope: TaskEnvelope) -> None:  # noqa: B027 - no-op default
+        """Default: horizon-unaware policies ignore the task envelope."""
+
+    def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:  # noqa: B027
+        """Optional: Hook called by eval() immediately before each trial's rollout.
+
+        This policy hook receives log context and is distinct from the sink bus
+        hook of the same name, which runs first with only scene id and epoch.
+        """
+
     def on_trial_end(self, record: TrialRecord, log_dir: str, run_id: str) -> None:  # noqa: B027
         """Optional: Hook called by eval() when a trial completes.
 
-        Called for errored and cancelled trials too, before sinks see the record.
-        Mutations to record.metadata land in the log, and exceptions degrade the
-        run to status="error" rather than crashing the overall evaluation.
+        Called for errored and cancelled trials too, except trials whose
+        ``on_trial_start`` raised, which never reached ``reset()``, before sinks
+        see the record. Mutations to record.metadata land in the log, and
+        exceptions degrade the run to status="error" rather than crashing the
+        overall evaluation.
         """
 
     def reset(self, scene: Scene) -> None:  # noqa: B027 - intentional no-op default

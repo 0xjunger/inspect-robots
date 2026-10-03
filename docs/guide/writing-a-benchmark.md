@@ -41,6 +41,49 @@ analog):
   records it in the log, so even "unseeded" runs are reproducible after the
   fact, and distinct from `seed=0`.)
 
+## Automatic task generation
+
+[`generate_scene`](/api/#inspect_robots.taskgen.generate_scene) can ask a
+vision-capable model to design one task from an embodiment's initial camera
+frames. The result has two consumers: `scene.instruction` is handed to the
+policy, while `scene.metadata["rubric"]` is handed to the grader. The scene
+metadata, including the generated rubric and generation provenance, is copied
+into the per-scene eval-log result.
+
+By default, the model is told to inspect the visible tabletop, choose one
+concrete manipulation task that a single arm could plausibly attempt, use only
+visible items, and write observable success conditions that are meaningful,
+fair, and achievable. Pass `instructions="..."` to replace those design
+instructions, or `instructions_file="prompt.txt"` to read them from a UTF-8
+file. The required `TASK:` and `RUBRIC:` reply format is always appended and
+cannot be overridden.
+
+Generation performs a peek reset before evaluation. Pass the same integer
+`seed` to `generate_scene()` and `eval()` so a seedable simulator presents the
+same epoch-zero layout to the task designer and the policy:
+
+```python
+from inspect_robots import Task, eval, generate_scene
+from inspect_robots.scorer import operator_scorer
+
+seed = 0
+scene = generate_scene(
+    embodiment,
+    model="claude-sonnet-4-5",
+    seed=seed,
+)
+task = Task(
+    name="generated-tabletop-task",
+    scenes=[scene],
+    scorer=operator_scorer(),
+    max_steps=300,
+)
+logs = eval(task, policy, embodiment, seed=seed)
+```
+
+The caller owns the embodiment throughout this sequence. Generation leaves it
+open for the subsequent evaluation.
+
 ## Epochs and reducers
 
 Repeat each scene `epochs` times to measure stochastic policies. The
@@ -62,6 +105,31 @@ task = Task(
     max_steps=200,
 )
 ```
+
+## Horizons
+
+A task declares exactly one rollout horizon. Use `max_steps` when the protocol
+is inherently discrete, as in the examples above. Use `max_seconds` when every
+embodiment should receive the same physical-time budget:
+
+```python
+task = Task(
+    name="two-minute-reach",
+    scenes=[...],
+    scorer=success_at_end(),
+    max_seconds=120.0,
+)
+```
+
+At evaluation time, Inspect Robots resolves the budget as
+`ceil(max_seconds * embodiment.info.control_hz)`. A 120-second task therefore
+runs for 1,200 steps at 10 Hz and 1,800 steps at 15 Hz. The eval log records
+both the declared seconds and the resolved integer step limit.
+
+A seconds-based task is incompatible with an embodiment whose `control_hz` is
+missing, non-finite, zero, or negative. Event-driven embodiments should use
+`max_steps`. Resolution changes the step budget only: `rollout()` does not add
+wall-clock pacing, so real-time cadence remains the embodiment's responsibility.
 
 ## Registering for discovery
 

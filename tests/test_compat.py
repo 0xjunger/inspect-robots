@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -68,6 +70,30 @@ def test_control_mode_mismatch_is_error() -> None:
     assert any(i.code == "control_mode" for i in report.errors)
 
 
+def test_embodiment_only_max_step_declaration_is_compatible() -> None:
+    policy = _StubPolicy(
+        PolicyInfo(
+            name="absolute-policy",
+            action_space=Box(
+                shape=(2,),
+                semantics=ActionSemantics(control_mode="joint_pos"),
+            ),
+        )
+    )
+    embodiment = CubePickEmbodiment()
+    embodiment.info = replace(
+        embodiment.info,
+        action_space=Box(
+            shape=(2,),
+            low=np.zeros(2),
+            high=np.ones(2),
+            semantics=ActionSemantics(control_mode="joint_pos", max_step=(None, 0.1)),
+        ),
+    )
+
+    assert check_compatibility(policy, embodiment).ok
+
+
 def test_missing_required_state_is_error() -> None:
     policy = _StubPolicy(
         PolicyInfo(
@@ -111,6 +137,48 @@ def test_scene_target_realizability() -> None:
     )
     report = check_compatibility(ScriptedPolicy(), embodiment, task)
     assert any(i.code == "scene_target" for i in report.errors)
+
+
+def test_seconds_task_with_valid_control_rate_is_compatible() -> None:
+    task = Task(
+        name="timed",
+        scenes=[Scene(id="s", instruction="x")],
+        scorer=success_at_end(),
+        max_seconds=120.0,
+    )
+    report = check_compatibility(ScriptedPolicy(), CubePickEmbodiment(), task)
+    assert not any(i.code == "task_horizon_control_rate" for i in report.errors)
+
+
+@pytest.mark.parametrize("control_hz", [None, True, 0.0, -1.0, float("nan"), float("inf")])
+def test_seconds_task_requires_positive_finite_control_rate(
+    control_hz: float | None,
+) -> None:
+    embodiment = CubePickEmbodiment()
+    embodiment.info = replace(embodiment.info, control_hz=control_hz)
+    task = Task(
+        name="timed",
+        scenes=[Scene(id="s", instruction="x")],
+        scorer=success_at_end(),
+        max_seconds=120.0,
+    )
+    report = check_compatibility(ScriptedPolicy(), embodiment, task)
+    issue = next(i for i in report.errors if i.code == "task_horizon_control_rate")
+    assert "finite positive embodiment rate" in issue.message
+
+
+def test_seconds_task_rejects_nonfinite_resolved_step_budget() -> None:
+    embodiment = CubePickEmbodiment()
+    embodiment.info = replace(embodiment.info, control_hz=1e308)
+    task = Task(
+        name="timed",
+        scenes=[Scene(id="s", instruction="x")],
+        scorer=success_at_end(),
+        max_seconds=1e308,
+    )
+    report = check_compatibility(ScriptedPolicy(), embodiment, task)
+    issue = next(i for i in report.errors if i.code == "task_horizon_control_rate")
+    assert "finite step budget" in issue.message
 
 
 def test_assert_compatible_raises() -> None:

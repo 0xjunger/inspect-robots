@@ -8,7 +8,7 @@ out-of-tree packages publish entry points, so an installed plugin appears in
 ## Decorators
 
 ```python
-from inspect_robots.registry import embodiment, policy, scorer, task
+from inspect_robots.registry import embodiment, operator_input, policy, scorer, task
 
 @policy("my-vla")
 class MyVLA: ...
@@ -21,6 +21,9 @@ def smooth(): ...
 
 @task("my-bench")
 def my_bench(): ...
+
+@operator_input("push-to-talk")
+def push_to_talk(): ...
 ```
 
 ## Resolving
@@ -45,16 +48,40 @@ openvla = "inspect_robots_openvla:OpenVLAPolicy"
 ```
 
 Groups: `inspect_robots.tasks`, `inspect_robots.policies`, `inspect_robots.embodiments`,
-`inspect_robots.scorers`, `inspect_robots.sinks`. After `pip install inspect-robots-maniskill`, it
-shows up in `inspect-robots list` and resolves by name in `eval()` and the CLI.
+`inspect_robots.scorers`, `inspect_robots.sinks`, and `inspect_robots.operator_inputs`. After
+`pip install inspect-robots-maniskill`, it shows up in `inspect-robots list` and resolves by name
+in `eval()` and the CLI.
 
 This is how the ecosystem stays decoupled: this repository is the framework;
 specific simulators, VLA weights, and benchmarks live in their own packages.
 
+### Reading user defaults
+
+Plugin CLIs can read the configuration written by `inspect-robots setup`
+through `inspect_robots.defaults`. Constructor args belong to the component
+named by their owner field — apply `embodiment_args` only when the owner is
+the embodiment *your* plugin drives, or args recorded for another rig will
+configure yours:
+
+```python
+import os
+
+from inspect_robots.defaults import load_defaults
+
+defaults = load_defaults(os.environ)
+if defaults.embodiment_args_owner == "my_embodiment":
+    args = defaults.embodiment_args
+```
+
+A plugin that ships several embodiments (or expects subclasses registered by
+other packages) can resolve the owner with
+`inspect_robots.registry.registered("embodiment")` and check the factory's
+class instead of comparing names.
+
 ## First-party plugins
 
-Five adapters ship from the Inspect Robots repository as separate packages,
-covering both halves of an eval:
+Six plugins ship from the Inspect Robots repository as separate packages, covering policies,
+embodiments, and attended operator input:
 
 - [`inspect-robots-ros`](https://github.com/robocurve/inspect-robots/tree/main/plugins/inspect-robots-ros):
   run evals on ROS 1 or ROS 2 arms through rosbridge, with no ROS installation
@@ -76,6 +103,12 @@ covering both halves of an eval:
   Model-generated Python calls separately served SAM3, Contact-GraspNet, and
   Pyroki helpers, then queues approver-checked joint targets behind `--policy
   capx`.
+- [`inspect-robots-voice`](https://github.com/robocurve/inspect-robots/tree/main/plugins/inspect-robots-voice):
+  transcribe local microphone speech into feedback during an attended run with
+  `--voice`, or narrate streamed policy notes through local Kokoro speech with
+  `run --speak`. Silence filtering protects the input path. Speech synthesis and
+  playback always run on a worker, while blocking speech may wait boundedly on
+  that work from the control thread.
 
 ### `inspect-robots-isaacsim`: the body
 

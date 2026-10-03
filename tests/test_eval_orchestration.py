@@ -3,13 +3,17 @@ partial-record delivery, fail_on_error timing, embodiment lifecycle, seeding."""
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from inspect_robots import eval, eval_set, read_eval_log
+from inspect_robots.console import ConsolePoll, EndRequest
 from inspect_robots.errors import (
+    CompatibilityError,
     ConfigError,
     EmbodimentFault,
     PolicyError,
@@ -17,7 +21,7 @@ from inspect_robots.errors import (
     _CancelledTrial,
 )
 from inspect_robots.eval import _git_commit
-from inspect_robots.log import EvalLog
+from inspect_robots.log import EvalLog, EvalSpec
 from inspect_robots.logging.json_log import JsonLogSink
 from inspect_robots.logging.sink import NullSink
 from inspect_robots.mock import CubePickEmbodiment, ScriptedPolicy
@@ -26,7 +30,7 @@ from inspect_robots.registry import embodiment as embodiment_decorator
 from inspect_robots.rollout import TrialRecord
 from inspect_robots.scene import Scene, Target
 from inspect_robots.scorer import Score, min_distance_to_goal, operator_scorer, success_at_end
-from inspect_robots.spaces import ActionSemantics, Box
+from inspect_robots.spaces import ActionSemantics, Box, ObservationSpace
 from inspect_robots.task import Epochs, Task, TaskEnvelope
 from inspect_robots.types import Action, ActionChunk, Observation, StepResult
 
@@ -137,6 +141,75 @@ class _CountingScorer:
         return Score(value=1.0)
 
 
+class _CaptureGrader:
+    """Record every trial presented to the pre-scoring grader seam.
+
+    ``parked_at_grade`` snapshots ``parked_observation`` at call time, so a
+    regression that populated the field only after ``before_scoring`` returned
+    cannot slip past assertions made on the shared mutable record.
+    """
+
+    name = "capture"
+
+    def __init__(self) -> None:
+        self.records: list[TrialRecord] = []
+        self.parked_at_grade: list[object] = []
+
+    def grade(self, record: TrialRecord, scene: Scene) -> None:
+        del scene
+        self.records.append(record)
+        self.parked_at_grade.append(record.parked_observation)
+
+
+class _ParkedEmbodiment(CubePickEmbodiment):
+    """Return or raise one configured result from the optional park hook."""
+
+    def __init__(self, park_result: object) -> None:
+        super().__init__()
+        self.park_result = park_result
+        self.park_calls = 0
+
+    def observe_parked(self) -> object:
+        self.park_calls += 1
+        if isinstance(self.park_result, BaseException):
+            raise self.park_result
+        return self.park_result
+
+
+class _ScriptedOperatorInput:
+    """Expose per-trial polls and model input typed between trial boundaries."""
+
+    def __init__(self, trials: list[list[ConsolePoll]]) -> None:
+        self.trials = trials
+        self.active: list[ConsolePoll] = []
+        self.pending_messages: list[str] = []
+        self.discarded_messages: list[str] = []
+        self.begin_calls = 0
+
+    def poll(self) -> ConsolePoll:
+        """Merge pending input with the next scripted poll for the active trial."""
+        scripted = self.active.pop(0) if self.active else ConsolePoll()
+        pending = tuple(self.pending_messages)
+        messages = (*pending, *scripted.messages)
+        sources = (
+            *("console" for _ in pending),
+            *(
+                scripted.sources[i] if i < len(scripted.sources) else "console"
+                for i in range(len(scripted.messages))
+            ),
+        )
+        self.pending_messages.clear()
+        return ConsolePoll(messages=messages, end=scripted.end, sources=sources)
+
+    def begin_trial(self) -> None:
+        """Discard inter-trial input and activate the next trial's poll script."""
+        self.begin_calls += 1
+        self.discarded_messages.extend(self.pending_messages)
+        self.pending_messages.clear()
+        index = self.begin_calls - 1
+        self.active = list(self.trials[index]) if index < len(self.trials) else []
+
+
 # --------------------------------------------------------------------------- #
 # Ctrl-C during rollout writes a partial cancelled log before propagating.
 # --------------------------------------------------------------------------- #
@@ -213,6 +286,7 @@ def test_cancelled_policy_reset_records_t_minus_one_and_zero_steps(tmp_path: Pat
             _task(),
             _ResetInterruptPolicy(),
             CubePickEmbodiment(),
+            log_dir=str(tmp_path),
             sinks=[records, json_sink],
         )
 
@@ -259,6 +333,7 @@ def test_cancelled_trial_is_never_scored() -> None:
             _InterruptingPolicy(KeyboardInterrupt(), interrupt_on_call=1),
             CubePickEmbodiment(),
             sinks=[NullSink()],
+            store_actions=False,
         )
 
     assert scorer.calls == 0
@@ -299,6 +374,7 @@ def test_errored_then_cancelled_epochs_preserve_both_records(tmp_path: Path) -> 
             _task(epochs=2),
             _ErrorThenCancelPolicy(),
             CubePickEmbodiment(),
+            log_dir=str(tmp_path),
             sinks=[records, json_sink],
         )
 
@@ -347,6 +423,183 @@ def test_categorical_scorer_with_mean_reducer_degrades_to_error_log(tmp_path: Pa
     assert log.results.metrics == {}  # the failed reducer contributes no metric
 
 
+def test_raising_scorer_degrades_to_error_log(tmp_path: Path) -> None:
+    # Issue #451: scoring runs after the rollout, so an exception escaping a
+    # scorer used to discard every trial that had already been paid for.
+    class _FlakyScorer:
+        name = "flaky"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, record: TrialRecord, target: object) -> object:
+            from inspect_robots.scorer import Score
+
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("scorer bug")
+            return Score(value=True)
+
+    task = _task(epochs=2, scorer=_FlakyScorer())
+    (log,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert log.status == "error"
+    assert log.error is not None and "scorer 'flaky' failed" in log.error
+    assert log.samples[0].status == "error"
+    assert log.results.total_trials == 2  # the trials that ran are still there
+    assert list(tmp_path.glob("*.json"))  # ...and the log reached disk
+
+
+@pytest.mark.parametrize(
+    "halt",
+    [SafetyAbort("e-stop"), EmbodimentFault("motor stalled")],
+    ids=["safety_abort", "embodiment_fault"],
+)
+def test_scorer_halt_signals_stop_the_eval(tmp_path: Path, halt: Exception) -> None:
+    # The scorer guard must not contain halt signals: swallowing one would let
+    # the next rollout start after an explicit abort or a hardware fault.
+    class _HaltingScorer:
+        name = "halting"
+
+        def __call__(self, record: TrialRecord, target: object) -> object:
+            raise halt
+
+    class _CountingEmbodiment(CubePickEmbodiment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resets = 0
+
+        def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
+            self.resets += 1
+            return super().reset(scene, seed=seed)
+
+    task = Task(
+        name="t",
+        scenes=[Scene(id=f"s{i}", instruction="reach", init_seed=i) for i in range(3)],
+        scorer=_HaltingScorer(),  # type: ignore[arg-type]
+        max_steps=60,
+    )
+
+    embodiment = _CountingEmbodiment()
+    with pytest.raises(type(halt)):
+        eval(task, ScriptedPolicy(), embodiment, log_dir=str(tmp_path))
+    assert embodiment.resets == 1  # the scene that halted, and no scene after it
+
+    # eval_set re-raises halts rather than turning them into an error log,
+    # so the remaining tasks must not run either.
+    embodiment = _CountingEmbodiment()
+    with pytest.raises(type(halt)):
+        eval_set([task, task], ScriptedPolicy(), embodiment, log_dir=str(tmp_path))
+    assert embodiment.resets == 1
+
+
+def test_scorer_returning_unconvertible_value_degrades_to_error_log(
+    tmp_path: Path,
+) -> None:
+    # The same guard covers value_to_float(): a scorer can fail by returning a
+    # bad value just as easily as by raising.
+    class _BadValueScorer:
+        name = "bad_value"
+
+        def __call__(self, record: TrialRecord, target: object) -> object:
+            from inspect_robots.scorer import Score
+
+            return Score(value=object())  # type: ignore[arg-type]
+
+    task = _task(scorer=_BadValueScorer())
+    (log,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert log.status == "error"
+    assert log.error is not None and "scorer 'bad_value' failed" in log.error
+    assert log.results.total_trials == 1
+
+
+class _AbstainOnEpoch:
+    """Abstains on the listed epochs and reports success on the rest."""
+
+    name = "abstains"
+
+    def __init__(self, epochs: set[int]) -> None:
+        self.epochs = epochs
+
+    def __call__(self, record: TrialRecord, target: object) -> Score:
+        if record.epoch in self.epochs:
+            return Score(value=None, explanation="abstain: no operator verdict recorded")
+        return Score(value=True)
+
+
+def test_abstaining_scorer_records_no_verdict_rather_than_an_error(tmp_path: Path) -> None:
+    # Issue #436: Score(value=None) used to crash value_to_float, which the
+    # scorer guard then turned into an error log.
+    task = _task(epochs=2, scorer=_AbstainOnEpoch({0, 1}))
+    (log,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert log.status == "success"
+    assert log.error is None
+    scene = log.samples[0]
+    assert scene.status == "success"
+    assert scene.epochs == ({"abstains": None}, {"abstains": None})
+    assert scene.reduced == {"abstains": None}
+    assert log.results.metrics == {"abstains": None}
+    assert log.results.abstentions == {"abstains": 2}
+
+    # The abstention survives the JSON round trip as null, distinct from 0.0
+    # and from an errored trial's empty epoch entry.
+    (written,) = tmp_path.glob("*.json")
+    read_back = read_eval_log(str(written))
+    assert read_back.samples[0].epochs == ({"abstains": None}, {"abstains": None})
+    assert read_back.results.metrics == {"abstains": None}
+    assert read_back.results.abstentions == {"abstains": 2}
+
+
+def test_abstained_epochs_and_scenes_are_left_out_of_the_metric(tmp_path: Path) -> None:
+    class _AbstainOnScene(_AbstainOnEpoch):
+        def __call__(self, record: TrialRecord, target: object) -> Score:
+            if record.scene_id == "s1":
+                return Score(value=None)
+            return super().__call__(record, target)
+
+    task = Task(
+        name="t",
+        scenes=[Scene(id=f"s{i}", instruction="reach", init_seed=i) for i in range(2)],
+        scorer=_AbstainOnScene({1}),
+        max_steps=60,
+        epochs=2,
+    )
+    (log,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert log.status == "success"
+    s0, s1 = log.samples
+    assert s0.epochs == ({"abstains": 1.0}, {"abstains": None})
+    assert s0.reduced == {"abstains": 1.0}  # not 0.5: the abstention is not a failure
+    assert s1.reduced == {"abstains": None}
+    assert log.results.metrics == {"abstains": 1.0}
+    # s0 epoch 1 plus both s1 epochs: the denominator behind the 1.0.
+    assert log.results.abstentions == {"abstains": 3}
+
+
+def test_one_failing_scorer_keeps_the_others(tmp_path: Path) -> None:
+    # The guard is per scorer, so a sibling scorer's value for the same trial
+    # must survive. Two epochs also drive the repeat-failure path, where the run
+    # is already "error" and only the scene detail accumulates.
+    class _BoomScorer:
+        name = "boom"
+
+        def __call__(self, record: TrialRecord, target: object) -> object:
+            raise RuntimeError("boom")
+
+    task = Task(
+        name="t",
+        scenes=[Scene(id="s0", instruction="reach", init_seed=0)],
+        scorer=[_BoomScorer(), success_at_end()],  # type: ignore[list-item]
+        max_steps=60,
+        epochs=2,
+    )
+    (log,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert log.status == "error"
+    assert "boom" not in log.results.metrics  # the failed scorer contributes none
+    assert "success_at_end" in log.results.metrics  # ...the healthy one still does
+    # The run-level error keeps the first failure; the scene chains both.
+    scene_error = log.samples[0].error
+    assert scene_error is not None and scene_error.count("scorer 'boom' failed") == 2
+
+
 # --------------------------------------------------------------------------- #
 # 2. Errored trials are never scored and cannot poison metrics.
 # --------------------------------------------------------------------------- #
@@ -357,12 +610,15 @@ def test_errored_trials_are_not_scored(tmp_path: Path) -> None:
     assert scene.status == "error"  # the failed epoch is visible...
     assert scene.epochs[1] == {}  # ...as an empty (unscored) epoch entry
     # ...but the metric comes from the good epoch only: finite, not inf.
-    assert np.isfinite(log.results.metrics["min_distance_to_goal"])
+    distance = log.results.metrics["min_distance_to_goal"]
+    assert distance is not None and np.isfinite(distance)
     assert log.status == "success"  # data survived: partials stay tolerated
     assert log.results.errored_trials == 1
     assert log.results.total_trials == 2
     assert scene.termination_reasons == ("success", None)
+    assert scene.judgement_sources == (None, None)
     assert len(scene.termination_reasons) == len(scene.epochs)
+    assert len(scene.judgement_sources) == len(scene.epochs)
 
 
 def test_step_limit_reason_and_horizon_are_recorded(tmp_path: Path) -> None:
@@ -378,6 +634,69 @@ def test_all_trials_errored_degrades_to_error_status(tmp_path: Path) -> None:
     assert log.error == "all 1 trial(s) errored; nothing was scored"
     assert log.results.errored_trials == log.results.total_trials == 1
     assert log.results.metrics == {}
+
+
+def test_survivor_minority_across_errored_scenes_warns_but_keeps_status(
+    tmp_path: Path,
+) -> None:
+    # Issue #440: fail_on_error stays the caller's tolerance control, so a run
+    # with no clean scene keeps its status, but the caller must be warned that
+    # its metrics rest on a surviving minority.
+    class _FlakyPolicy(ScriptedPolicy):
+        def __init__(self) -> None:
+            super().__init__()
+            self._resets = 0
+
+        def reset(self, scene: Scene) -> None:
+            self._resets += 1
+            if self._resets > 1:
+                raise PolicyError(f"synthetic failure on trial {self._resets}")
+            super().reset(scene)
+
+    task = Task(
+        name="t",
+        scenes=[Scene(id="s0", instruction="reach", init_seed=0)],
+        scorer=success_at_end(),
+        max_steps=60,
+        epochs=6,
+    )
+    expected = r"no scene completed cleanly \(5 of 6 trial\(s\) errored\)"
+    with pytest.warns(UserWarning, match=expected):
+        (log,) = eval(task, _FlakyPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert log.status == "success"
+    assert log.results.errored_trials == 5
+    assert log.results.total_trials == 6
+    assert log.samples[0].status == "error"
+
+
+def test_partially_errored_run_with_clean_scene_stays_success(
+    tmp_path: Path,
+) -> None:
+    # A fully-errored scene next to a clean scene is partial failure, not
+    # survivor bias: the run stays successful and the bad scene stays visible.
+    class _BoomFirstScenePolicy(ScriptedPolicy):
+        def reset(self, scene: Scene) -> None:
+            if scene.id == "s0":
+                raise PolicyError("synthetic failure on s0")
+            super().reset(scene)
+
+    task = Task(
+        name="t",
+        scenes=[
+            Scene(id="s0", instruction="reach", init_seed=0),
+            Scene(id="s1", instruction="reach", init_seed=1),
+        ],
+        scorer=success_at_end(),
+        max_steps=60,
+        epochs=2,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        (log,) = eval(task, _BoomFirstScenePolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert log.status == "success"
+    assert [s.status for s in log.samples] == ["error", "success"]
+    assert log.results.errored_trials == 2
+    assert log.results.total_trials == 4
 
 
 def test_halt_error_message_is_not_overwritten_by_all_errored(tmp_path: Path) -> None:
@@ -408,7 +727,13 @@ def test_policy_error_partial_record_reaches_sinks() -> None:
             return ActionChunk(actions=[Action(data=np.zeros(2)) for _ in range(4)])
 
     sink = _RecordingSink()
-    (log,) = eval(_task(), _BoomLaterPolicy(), CubePickEmbodiment(), sinks=[sink])
+    (log,) = eval(
+        _task(),
+        _BoomLaterPolicy(),
+        CubePickEmbodiment(),
+        sinks=[sink],
+        store_actions=False,
+    )
     assert log.status == "error"  # its only trial errored (issue #73)
     (record,) = sink.records
     assert record.status == "error"
@@ -437,7 +762,11 @@ def test_halt_without_attached_record_still_produces_error_log(
 def test_halt_delivers_partial_record_and_counts_trial() -> None:
     sink = _RecordingSink()
     (log,) = eval(
-        _task(), ScriptedPolicy(), _FaultAfterEpochsEmbodiment(good_epochs=0), sinks=[sink]
+        _task(),
+        ScriptedPolicy(),
+        _FaultAfterEpochsEmbodiment(good_epochs=0),
+        sinks=[sink],
+        store_actions=False,
     )
     assert log.status == "error"
     assert log.results.total_trials == 1  # the aborted trial is counted...
@@ -456,6 +785,21 @@ def test_fail_on_error_true_stops_at_first_error(tmp_path: Path) -> None:
     )
     assert log.status == "error"
     assert log.results.total_trials == 1  # stopped immediately, not after 3 epochs
+
+
+@pytest.mark.parametrize(
+    "invalid_foe", [-1, -0.5, float("nan"), float("inf"), float("-inf"), "invalid"]
+)
+def test_eval_rejects_invalid_fail_on_error(tmp_path: Path, invalid_foe: object) -> None:
+    task = _task(epochs=1)
+    with pytest.raises(ConfigError, match="fail_on_error must be a boolean or finite float >= 0"):
+        eval(
+            task,
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            log_dir=str(tmp_path),
+            fail_on_error=invalid_foe,  # type: ignore[arg-type]
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -504,6 +848,91 @@ def test_eval_binds_adaptive_policy_before_compat(tmp_path: Path) -> None:
     assert logs[0].status == "success"
 
 
+def test_eval_binds_spaces_frames_and_scenes_to_duck_typed_sinks_before_start(
+    tmp_path: Path,
+) -> None:
+    """Offer optional sink bindings in order and skip absent or non-callable hooks."""
+
+    class _SpaceAware(NullSink):
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def bind_spaces(self, action_space: Box, observation_space: ObservationSpace) -> None:
+            self.calls.append(("bind_spaces", action_space, observation_space))
+
+        def bind_frames_dir(self, frames_dir: str | None) -> None:
+            self.calls.append(("bind_frames_dir", frames_dir))
+
+        def bind_scenes(self, scenes: Sequence[Scene]) -> None:
+            """Record the offered scenes for ordering assertions."""
+            self.calls.append(("bind_scenes", scenes))
+
+        def on_eval_start(self, spec: EvalSpec) -> None:
+            del spec
+            self.calls.append(("on_eval_start",))
+
+    class _OddAttr(NullSink):
+        bind_spaces = "not a hook"
+        bind_frames_dir = "not a hook"
+        bind_scenes = "not a hook"
+
+    embodiment = CubePickEmbodiment()
+    aware = _SpaceAware()
+    no_hook = NullSink()
+    odd = _OddAttr()
+
+    task = _task(max_steps=1)
+    (log,) = eval(
+        task,
+        ScriptedPolicy(),
+        embodiment,
+        sinks=[aware, no_hook, odd],
+        log_dir=str(tmp_path),
+    )
+
+    assert log.status == "success"
+    assert aware.calls == [
+        (
+            "bind_spaces",
+            embodiment.info.action_space,
+            embodiment.info.observation_space,
+        ),
+        ("bind_frames_dir", None),
+        ("bind_scenes", task.scenes),
+        ("on_eval_start",),
+    ]
+    assert getattr(no_hook, "bind_spaces", None) is None
+    assert odd.bind_spaces == "not a hook"
+    assert getattr(no_hook, "bind_frames_dir", None) is None
+    assert odd.bind_frames_dir == "not a hook"
+    assert getattr(no_hook, "bind_scenes", None) is None
+    assert odd.bind_scenes == "not a hook"
+
+
+def test_eval_binds_the_exact_stored_frames_directory(tmp_path: Path) -> None:
+    """The optional hook receives the same string persisted on the final log."""
+
+    class _FrameAware(NullSink):
+        def __init__(self) -> None:
+            self.frames_dir: str | None = None
+
+        def bind_frames_dir(self, frames_dir: str | None) -> None:
+            self.frames_dir = frames_dir
+
+    sink = _FrameAware()
+    (log,) = eval(
+        _task(max_steps=1),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        sinks=[sink],
+        log_dir=str(tmp_path),
+        store_frames=True,
+    )
+
+    assert sink.frames_dir == log.stats.frames_dir
+    assert sink.frames_dir is not None
+
+
 def test_eval_binds_task_envelope_before_reset(tmp_path: Path) -> None:
     """bind_task fires once per eval with the task's envelope, before any reset."""
 
@@ -536,6 +965,30 @@ def test_eval_binds_task_envelope_before_reset(tmp_path: Path) -> None:
     # Exactly one bind per eval — not per scene or per epoch; resets follow it.
     assert aware.calls.count("reset") == 4
     assert [c for c in aware.calls if c != "reset"] == [TaskEnvelope(name="t", max_steps=7)]
+
+
+def test_eval_resolves_seconds_horizon_into_envelope_rollout_and_log(tmp_path: Path) -> None:
+    class _HorizonAware(CubePickEmbodiment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.envelopes: list[TaskEnvelope] = []
+
+        def bind_task(self, envelope: TaskEnvelope) -> None:
+            self.envelopes.append(envelope)
+
+    task = Task(
+        name="timed",
+        scenes=[Scene(id="s", instruction="reach")],
+        scorer=success_at_end(),
+        max_seconds=0.1,
+    )
+    aware = _HorizonAware()
+    (log,) = eval(task, ScriptedPolicy(), aware, log_dir=str(tmp_path))
+
+    assert aware.envelopes == [TaskEnvelope(name="timed", max_steps=1)]
+    assert log.samples[0].termination_reasons == ("max_steps",)
+    assert log.eval.max_seconds == 0.1
+    assert log.eval.max_steps == 1
 
 
 def test_bind_task_rebinds_per_eval_latest_wins(tmp_path: Path) -> None:
@@ -578,8 +1031,8 @@ def test_raising_bind_task_aborts_before_any_rollout(tmp_path: Path) -> None:
     assert _CLOSED == ["closed"]  # registry-owned embodiment still released
 
 
-def test_bind_task_runs_before_the_compatibility_check(tmp_path: Path) -> None:
-    """The hook fires pre-compat: a raising bind_task wins over an incompatible pairing."""
+def test_compatibility_check_runs_before_bind_task(tmp_path: Path) -> None:
+    """An incompatible pair fails before the embodiment receives an envelope."""
 
     class _WidePolicy(ScriptedPolicy):
         def __init__(self) -> None:
@@ -589,8 +1042,32 @@ def test_bind_task_runs_before_the_compatibility_check(tmp_path: Path) -> None:
                 action_space=Box(shape=(9,), semantics=ActionSemantics("joint_pos")),
             )
 
-    with pytest.raises(RuntimeError, match="refusing this task"):
+    with pytest.raises(CompatibilityError, match="action_dim"):
         eval(_task(max_steps=5), _WidePolicy(), "bind-raises-cubepick", log_dir=str(tmp_path))
+
+
+def test_invalid_seconds_rate_fails_before_bind_task(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    class _RateMissing(CubePickEmbodiment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.info = replace(self.info, control_hz=None)
+            self.envelopes: list[TaskEnvelope] = []
+
+        def bind_task(self, envelope: TaskEnvelope) -> None:
+            self.envelopes.append(envelope)
+
+    task = Task(
+        name="timed",
+        scenes=[Scene(id="s", instruction="reach")],
+        scorer=success_at_end(),
+        max_seconds=120.0,
+    )
+    embodiment = _RateMissing()
+    with pytest.raises(CompatibilityError, match="task_horizon_control_rate"):
+        eval(task, ScriptedPolicy(), embodiment, log_dir=str(tmp_path))
+    assert embodiment.envelopes == []
 
 
 def test_embodiment_base_bind_task_is_a_noop() -> None:
@@ -688,6 +1165,7 @@ def test_policy_error_without_attached_record_synthesizes_one(tmp_path: Path) ->
         _task(),
         ScriptedPolicy(),
         CubePickEmbodiment(),
+        log_dir=str(tmp_path),
         sinks=[sink],
         controller=_EagerErrorController(),
     )
@@ -723,6 +1201,16 @@ def test_git_commit_clean_tree_has_no_suffix(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr("subprocess.run", fake_run)
     assert _git_commit() == "abc123"
+
+
+def test_git_commit_returns_unknown_when_status_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        if "rev-parse" in cmd:
+            return _FakeCompleted("abc123\n")
+        return _FakeCompleted("fatal: index is unreadable\n", returncode=128)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert _git_commit() is None
 
 
 # --------------------------------------------------------------------------- #
@@ -789,6 +1277,7 @@ def test_before_scoring_exception_propagates(tmp_path: Path) -> None:
 def test_before_scoring_default_none_records_no_judgements(tmp_path: Path) -> None:
     (log,) = eval(_task(epochs=2), ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
     assert log.samples[0].operator_judgements == (None, None)
+    assert log.samples[0].operator_messages == ((), ())
 
 
 def test_eval_set_forwards_before_scoring(tmp_path: Path) -> None:
@@ -807,9 +1296,371 @@ def test_eval_set_forwards_before_scoring(tmp_path: Path) -> None:
     assert logs[0].results.metrics["operator"] == 1.0
 
 
+def test_eval_set_rejects_empty_task_list(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"eval_set\(\) requires at least one task"):
+        eval_set(
+            [],
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            log_dir=str(tmp_path),
+        )
+
+
+def test_eval_observes_parked_once_before_grading(tmp_path: Path) -> None:
+    parked = Observation(images={"parked": np.zeros((2, 2, 3), dtype=np.uint8)})
+    embodiment = _ParkedEmbodiment(parked)
+    grader = _CaptureGrader()
+
+    (log,) = eval(
+        _task(max_steps=1),
+        ScriptedPolicy(),
+        embodiment,
+        grader=grader,
+        log_dir=str(tmp_path),
+    )
+
+    assert log.status == "success"
+    assert embodiment.park_calls == 1
+    assert len(grader.records) == 1
+    assert grader.parked_at_grade[0] is parked
+
+
+def test_eval_does_not_observe_parked_without_a_grader(tmp_path: Path) -> None:
+    embodiment = _ParkedEmbodiment(Observation())
+
+    (log,) = eval(_task(max_steps=1), ScriptedPolicy(), embodiment, log_dir=str(tmp_path))
+
+    assert log.status == "success"
+    assert embodiment.park_calls == 0
+
+
+def test_eval_does_not_observe_parked_after_operator_judgement(tmp_path: Path) -> None:
+    embodiment = _ParkedEmbodiment(Observation())
+    grader = _CaptureGrader()
+    operator_input = _ScriptedOperatorInput([[ConsolePoll(end=EndRequest(verdict="y"))]])
+
+    (log,) = eval(
+        _task(max_steps=1),
+        ScriptedPolicy(),
+        embodiment,
+        grader=grader,
+        operator_input=operator_input,
+        log_dir=str(tmp_path),
+    )
+
+    assert embodiment.park_calls == 0
+    assert grader.records[0].operator_judgement == "y"
+    assert log.samples[0].judgement_sources == ("console",)
+
+
+def test_eval_does_not_observe_parked_after_definitive_termination(tmp_path: Path) -> None:
+    embodiment = _ParkedEmbodiment(Observation())
+    embodiment.goal_radius = 2.0
+    grader = _CaptureGrader()
+
+    eval(
+        _task(max_steps=1),
+        ScriptedPolicy(),
+        embodiment,
+        grader=grader,
+        log_dir=str(tmp_path),
+    )
+
+    assert embodiment.park_calls == 0
+    assert grader.records[0].termination_reason == "success"
+
+
+def test_eval_degrades_when_observe_parked_raises(tmp_path: Path) -> None:
+    embodiment = _ParkedEmbodiment(RuntimeError("park jammed"))
+    grader = _CaptureGrader()
+
+    with pytest.warns(
+        RuntimeWarning,
+        match=r"observe_parked\(\) failed with RuntimeError: park jammed",
+    ):
+        (log,) = eval(
+            _task(max_steps=1),
+            ScriptedPolicy(),
+            embodiment,
+            grader=grader,
+            log_dir=str(tmp_path),
+        )
+
+    assert grader.records[0].parked_observation is None
+    assert log.samples[0].epochs[0] == {"success_at_end": 0.0}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [SafetyAbort("park unsafe"), EmbodimentFault("park faulted")],
+)
+def test_eval_halts_when_observe_parked_raises_a_halt_error(
+    error: Exception, tmp_path: Path
+) -> None:
+    embodiment = _ParkedEmbodiment(error)
+
+    with pytest.raises(type(error), match=str(error)):
+        eval(
+            _task(max_steps=1),
+            ScriptedPolicy(),
+            embodiment,
+            grader=_CaptureGrader(),
+            log_dir=str(tmp_path),
+        )
+
+
+def test_eval_accepts_observe_parked_declining_without_warning(tmp_path: Path) -> None:
+    embodiment = _ParkedEmbodiment(None)
+    grader = _CaptureGrader()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        eval(
+            _task(max_steps=1),
+            ScriptedPolicy(),
+            embodiment,
+            grader=grader,
+            log_dir=str(tmp_path),
+        )
+
+    assert grader.records[0].parked_observation is None
+
+
+def test_eval_rejects_non_observation_parked_result(tmp_path: Path) -> None:
+    embodiment = _ParkedEmbodiment("not an observation")
+    grader = _CaptureGrader()
+
+    with pytest.warns(
+        RuntimeWarning,
+        match=(
+            "observe_parked\\(\\) returned str; expected Observation or None; "
+            "grading from last-step frames"
+        ),
+    ):
+        eval(
+            _task(max_steps=1),
+            ScriptedPolicy(),
+            embodiment,
+            grader=grader,
+            log_dir=str(tmp_path),
+        )
+
+    assert grader.records[0].parked_observation is None
+
+
+def test_eval_ignores_non_callable_observe_parked(tmp_path: Path) -> None:
+    class _OddAttr(CubePickEmbodiment):
+        observe_parked = "not a hook"
+
+    grader = _CaptureGrader()
+    embodiment = _OddAttr()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        eval(
+            _task(max_steps=1),
+            ScriptedPolicy(),
+            embodiment,
+            grader=grader,
+            log_dir=str(tmp_path),
+        )
+
+    assert grader.records[0].parked_observation is None
+    assert _OddAttr.observe_parked == "not a hook"
+
+
 # --------------------------------------------------------------------------- #
-# 9. on_trial_end hook: artifact persistence via trial metadata.
+# 9. Attended operator input is trial-scoped and persisted beside each epoch.
 # --------------------------------------------------------------------------- #
+def test_eval_begins_console_each_trial_and_discards_scoring_window_input(
+    tmp_path: Path,
+) -> None:
+    operator_input = _ScriptedOperatorInput(
+        [
+            [ConsolePoll(messages=("trial one feedback",), end=EndRequest())],
+            [ConsolePoll(end=EndRequest())],
+        ]
+    )
+
+    def type_during_scoring(record: TrialRecord, scene: Scene) -> None:
+        del scene
+        if record.epoch == 0:
+            operator_input.pending_messages.append("typed during scoring")
+
+    (log,) = eval(
+        _task(epochs=2, scorer=_CountingScorer()),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+        operator_input=operator_input,
+        before_scoring=type_during_scoring,
+    )
+
+    assert operator_input.begin_calls == 2
+    assert operator_input.discarded_messages == ["typed during scoring"]
+    assert log.samples[0].operator_messages == (
+        ({"t": 0, "text": "trial one feedback", "source": "console"},),
+        (),
+    )
+
+
+def test_eval_operator_message_source_round_trips_through_written_log(tmp_path: Path) -> None:
+    operator_input = _ScriptedOperatorInput(
+        [
+            [
+                ConsolePoll(
+                    messages=("persist this feedback",),
+                    end=EndRequest(),
+                    sources=("voice",),
+                )
+            ]
+        ]
+    )
+
+    (log,) = eval(
+        _task(scorer=_CountingScorer()),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+        operator_input=operator_input,
+    )
+
+    expected = (({"t": 0, "text": "persist this feedback", "source": "voice"},),)
+    assert log.samples[0].operator_messages == expected
+    (path,) = tmp_path.glob("*.json")
+    restored_messages = read_eval_log(str(path)).samples[0].operator_messages
+    assert isinstance(restored_messages, tuple)
+    assert isinstance(restored_messages[0], tuple)
+    assert restored_messages == expected
+
+
+# --------------------------------------------------------------------------- #
+# 10. Policy trial lifecycle hooks: setup and artifact persistence.
+# --------------------------------------------------------------------------- #
+def test_on_trial_start_runs_before_each_trials_first_act(tmp_path: Path) -> None:
+    events: list[tuple[object, ...]] = []
+
+    class _StartHookPolicy(ScriptedPolicy):
+        def __init__(self) -> None:
+            super().__init__()
+            self.epoch = -1
+
+        def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
+            self.epoch = epoch
+            events.append(("start", scene_id, epoch, log_dir, run_id))
+
+        def act(self, observation: Observation) -> ActionChunk:
+            events.append(("act", self.epoch))
+            return super().act(observation)
+
+    eval(_task(epochs=2), _StartHookPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+
+    starts = [event for event in events if event[0] == "start"]
+    assert [(event[1], event[2], event[3]) for event in starts] == [
+        ("s0", 0, str(tmp_path)),
+        ("s0", 1, str(tmp_path)),
+    ]
+    assert starts[0][4] == starts[1][4]
+    for epoch in range(2):
+        start_index = next(
+            i for i, event in enumerate(events) if event[:3] == ("start", "s0", epoch)
+        )
+        act_index = next(i for i, event in enumerate(events) if event == ("act", epoch))
+        assert start_index < act_index
+
+
+def test_raising_on_trial_start_skips_rollout_but_keeps_results_parallel(
+    tmp_path: Path,
+) -> None:
+    class _LifecycleSink(_RecordingSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.starts: list[tuple[str, int]] = []
+
+        def on_trial_start(self, scene_id: str, epoch: int) -> None:
+            self.starts.append((scene_id, epoch))
+
+    class _StartFailurePolicy(ScriptedPolicy):
+        def __init__(self) -> None:
+            super().__init__()
+            self.current_epoch = -1
+            self.resets: list[int] = []
+            self.acts: list[int] = []
+            self.ends: list[int] = []
+
+        def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
+            self.current_epoch = epoch
+            if epoch == 0:
+                raise RuntimeError("capture setup exploded")
+
+        def reset(self, scene: Scene) -> None:
+            self.resets.append(self.current_epoch)
+            super().reset(scene)
+
+        def act(self, observation: Observation) -> ActionChunk:
+            self.acts.append(self.current_epoch)
+            return super().act(observation)
+
+        def on_trial_end(self, record: TrialRecord, log_dir: str, run_id: str) -> None:
+            self.ends.append(record.epoch)
+
+    policy = _StartFailurePolicy()
+    sink = _LifecycleSink()
+    (log,) = eval(
+        _task(epochs=2),
+        policy,
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+        sinks=[sink, JsonLogSink(str(tmp_path))],
+    )
+
+    scene = log.samples[0]
+    parallel = (
+        scene.epochs,
+        scene.operator_judgements,
+        scene.operator_notes,
+        scene.operator_messages,
+        scene.trial_metadata,
+        scene.termination_reasons,
+        scene.policy_transcripts,
+    )
+    assert {len(values) for values in parallel} == {2}
+    assert scene.epochs[0] == {}
+    assert scene.error == "policy.on_trial_start failed: capture setup exploded"
+    assert log.results.total_trials == 2
+    assert log.results.errored_trials == 1
+    assert policy.resets == [1]
+    assert policy.acts and set(policy.acts) == {1}
+    assert policy.ends == [1]
+    assert sink.starts == [("s0", 0), ("s0", 1)]
+    assert [record.epoch for record in sink.records] == [0, 1]
+    assert sink.records[0].status == "error"
+    assert sink.records[0].error == scene.error
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+def test_raising_on_trial_start_counts_toward_fail_on_error(tmp_path: Path) -> None:
+    class _SecondStartFails(ScriptedPolicy):
+        def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
+            if epoch == 1:
+                raise RuntimeError("second setup exploded")
+
+    (log,) = eval(
+        _task(epochs=3),
+        _SecondStartFails(),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+        fail_on_error=True,
+    )
+
+    assert log.status == "error"
+    assert log.error == "fail_on_error threshold exceeded (1 errors)"
+    assert log.results.total_trials == 2
+    assert log.results.errored_trials == 1
+    assert len(log.samples[0].epochs) == 2
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+
 def test_on_trial_end_hook_persists_metadata_and_recovers_from_errors(tmp_path: Path) -> None:
     task = _task(epochs=2)
     seen_ids: list[str] = []
@@ -831,9 +1682,12 @@ def test_on_trial_end_hook_persists_metadata_and_recovers_from_errors(tmp_path: 
 
     scene = log.samples[0]
     # The first epoch succeeded so its metadata is retained.
-    # The second epoch failed in the hook, so its metadata contains
-    # whatever was populated before the crash (empty).
-    assert scene.trial_metadata == ({"test_key": "test_val"}, {})
+    # The second epoch failed in the hook, so only framework metadata follows
+    # it into the log; both delivered trials receive action side-car pointers.
+    first_metadata, second_metadata = scene.trial_metadata
+    assert first_metadata["test_key"] == "test_val"
+    assert set(first_metadata) == {"test_key", "actions"}
+    assert set(second_metadata) == {"actions"}
     assert len(seen_ids) == 2
     assert seen_ids[0] == seen_ids[1]
 
@@ -929,3 +1783,167 @@ def test_hookless_policy_yields_all_none_transcripts(tmp_path: Path) -> None:
 
     (log,) = eval(_task(epochs=2), _HooklessPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
     assert log.samples[0].policy_transcripts == (None, None)
+
+
+def test_policy_bind_task_hook_receives_task_envelope(tmp_path: Path) -> None:
+    class _TaskAwarePolicy:
+        def __init__(self) -> None:
+            self._delegate = ScriptedPolicy()
+            self.info = self._delegate.info
+            self.config = self._delegate.config
+            self.bound_envelope: object = None
+
+        def bind_task(self, envelope: object) -> None:
+            self.bound_envelope = envelope
+
+        def reset(self, scene: Scene) -> None:
+            self._delegate.reset(scene)
+
+        def act(self, observation: Observation) -> ActionChunk:
+            return self._delegate.act(observation)
+
+    pol = _TaskAwarePolicy()
+    eval(_task(max_steps=42), pol, CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert pol.bound_envelope is not None
+    assert getattr(pol.bound_envelope, "max_steps", None) == 42
+
+
+def test_policy_base_bind_task_noop() -> None:
+    from inspect_robots.policy import PolicyBase
+    from inspect_robots.task import TaskEnvelope
+
+    class _ConcretePolicy(PolicyBase):
+        def act(self, observation: Observation) -> ActionChunk:
+            raise NotImplementedError
+
+    pol = _ConcretePolicy()
+    pol.bind_task(TaskEnvelope(name="t", max_steps=10))
+
+
+class _UngradedGrader:
+    """A grader that tries and fails on the listed epochs (plan 0085)."""
+
+    name = "flaky-judge"
+
+    def __init__(self, epochs: set[int], *, also_judge: bool = False) -> None:
+        self.epochs = epochs
+        self.also_judge = also_judge
+
+    def grade(self, record: TrialRecord, scene: Scene) -> None:
+        if record.epoch in self.epochs:
+            record.metadata["grading_error"] = "grading request failed with HTTP 400: nope"
+            if self.also_judge:
+                record.operator_judgement = "success"
+        else:
+            record.operator_judgement = "success"
+
+
+def test_ungraded_trials_abstain_and_fail_the_run_without_stopping(tmp_path: Path) -> None:
+    task = _task(epochs=3, scorer=operator_scorer())
+    (log,) = eval(
+        task,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        grader=_UngradedGrader({1}),
+        log_dir=str(tmp_path),
+    )
+
+    assert log.status == "error"
+    assert log.error == (
+        "1 of 3 trial(s) ungraded: grader failed (grading request failed with HTTP 400: nope)"
+    )
+    assert log.samples[0].epochs == ({"operator": 1.0}, {"operator": None}, {"operator": 1.0})
+    assert log.results.metrics == {"operator": 1.0}
+    assert log.results.abstentions == {"operator": 1}
+    assert log.samples[0].trial_metadata[1]["grading_error"].startswith("grading request failed")
+
+
+def test_a_recorded_judgement_wins_over_a_grading_error(tmp_path: Path) -> None:
+    (log,) = eval(
+        _task(epochs=2, scorer=operator_scorer()),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        grader=_UngradedGrader({0}, also_judge=True),
+        log_dir=str(tmp_path),
+    )
+    assert log.status == "success"
+    assert log.results.abstentions == {}
+
+
+def test_ungraded_count_is_appended_to_a_more_specific_error(tmp_path: Path) -> None:
+    (log,) = eval(
+        _task(epochs=2, scorer=operator_scorer()),
+        _BoomOnSecondEpochPolicy(),
+        CubePickEmbodiment(),
+        grader=_UngradedGrader({0}),
+        fail_on_error=True,
+        log_dir=str(tmp_path),
+    )
+    assert log.status == "error"
+    assert log.error is not None
+    assert log.error.startswith("fail_on_error threshold exceeded")
+    assert log.error.endswith("; 1 of 1 trial(s) ungraded")
+
+
+def test_pass_at_k_with_partial_abstention_keeps_the_reducer_error(tmp_path: Path) -> None:
+    (log,) = eval(
+        _task(epochs=Epochs(count=3, reducer="pass_at_2"), scorer=operator_scorer()),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        grader=_UngradedGrader({0, 1}),
+        log_dir=str(tmp_path),
+    )
+    assert log.status == "error"
+    assert log.error is not None
+    assert "reducer 'pass_at_2' failed" in log.error
+    assert log.error.endswith("; 2 of 3 trial(s) ungraded")
+
+
+class _RejectingPreflightGrader(_UngradedGrader):
+    """A grader whose preflight rejects, as a misconfigured VLM grader would."""
+
+    def __init__(self) -> None:
+        super().__init__(set())
+        self.preflights = 0
+
+    def preflight(self) -> None:
+        self.preflights += 1
+        raise ConfigError("grading preflight request failed with HTTP 400: bad effort")
+
+
+class _ResetCountingEmbodiment(CubePickEmbodiment):
+    resets = 0
+
+    def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
+        type(self).resets += 1
+        return super().reset(scene, seed=seed)
+
+
+def test_preflight_rejection_stops_eval_before_any_rollout(tmp_path: Path) -> None:
+    _ResetCountingEmbodiment.resets = 0
+    grader = _RejectingPreflightGrader()
+    with pytest.raises(ConfigError, match="preflight request failed"):
+        eval(
+            _task(scorer=operator_scorer()),
+            ScriptedPolicy(),
+            _ResetCountingEmbodiment(),
+            grader=grader,
+            log_dir=str(tmp_path),
+        )
+    assert _ResetCountingEmbodiment.resets == 0
+    assert not list(tmp_path.glob("*.json"))
+
+
+def test_preflight_rejection_stops_eval_set_before_the_first_task(tmp_path: Path) -> None:
+    _ResetCountingEmbodiment.resets = 0
+    grader = _RejectingPreflightGrader()
+    with pytest.raises(ConfigError, match="preflight request failed"):
+        eval_set(
+            [_task(scorer=operator_scorer()), _task(scorer=operator_scorer())],
+            ScriptedPolicy(),
+            _ResetCountingEmbodiment(),
+            grader=grader,
+            log_dir=str(tmp_path),
+        )
+    assert grader.preflights == 1
+    assert _ResetCountingEmbodiment.resets == 0

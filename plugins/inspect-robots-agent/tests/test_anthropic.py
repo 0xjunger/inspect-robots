@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -13,12 +14,16 @@ from inspect_robots.errors import ConfigError
 from inspect_robots.mock import CubePickEmbodiment
 from inspect_robots.scene import Scene
 from inspect_robots.types import Observation
-from inspect_robots_agent import LLMAgentPolicy
+from inspect_robots_agent import AgentPolicyConfig, LLMAgentPolicy
 from inspect_robots_agent._anthropic import (
     _DEFAULT_MAX_OUTPUT_TOKENS,
     AnthropicClient,
+    _parse_response,
+    _translate_messages,
+    _with_cache_breakpoint,
 )
-from inspect_robots_agent._llm import Provider
+from inspect_robots_agent._capture import WireCapture
+from inspect_robots_agent._llm import ChatClient, Provider
 from inspect_robots_agent._png import png_data_url
 
 # -- fixtures --------------------------------------------------------------------
@@ -87,6 +92,11 @@ def _capture(*responses: dict[str, Any], status: int = 200) -> tuple[list[httpx.
     return seen, handler
 
 
+def _wire_rows(tmp_path: Path) -> list[dict[str, Any]]:
+    path = tmp_path / "wire/run-1/scene-e0/calls.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
 _SYSTEM = {"role": "system", "content": "you drive a robot"}
 _USER = {"role": "user", "content": "Goal: pick the cube"}
 
@@ -105,7 +115,13 @@ def test_request_shape_and_headers() -> None:
     assert body["model"] == "claude-opus-5"
     assert body["max_tokens"] == _DEFAULT_MAX_OUTPUT_TOKENS
     assert body["thinking"] == {"type": "adaptive"}
-    assert body["system"] == "you drive a robot"
+    assert body["system"] == [
+        {
+            "type": "text",
+            "text": "you drive a robot",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
     assert body["output_config"] == {"effort": "low"}
     assert body["tools"] == [
         {
@@ -127,9 +143,20 @@ def test_optional_fields_omitted_when_unset() -> None:
     _client(handler).complete([_USER], [])
 
     body = json.loads(seen[0].content)
+    assert body["thinking"] == {"type": "adaptive"}
     assert "tools" not in body
     assert "output_config" not in body
     assert "system" not in body
+
+
+def test_none_effort_disables_thinking_without_output_config() -> None:
+    seen, handler = _capture(_anthropic_response(_text("hi"), stop_reason="end_turn"))
+
+    _client(handler).complete([_USER], [], reasoning_effort="none")
+
+    body = json.loads(seen[0].content)
+    assert body["thinking"] == {"type": "disabled"}
+    assert "output_config" not in body
 
 
 def test_temperature_forwarded_when_set() -> None:
@@ -149,6 +176,17 @@ def test_fast_mode_sends_speed_and_beta_header() -> None:
     assert seen[0].headers["anthropic-beta"] == "fast-mode-2026-02-01"
 
 
+def test_fast_mode_passes_through_with_none_effort() -> None:
+    seen, handler = _capture(_anthropic_response(_text("hi"), stop_reason="end_turn"))
+
+    _client(handler, speed="fast").complete([_USER], [], reasoning_effort="none")
+
+    body = json.loads(seen[0].content)
+    assert body["speed"] == "fast"
+    assert body["thinking"] == {"type": "disabled"}
+    assert "output_config" not in body
+
+
 def test_empty_api_key_omits_header() -> None:
     seen, handler = _capture(_anthropic_response(_text("hi"), stop_reason="end_turn"))
     provider = Provider(base_url="http://llm.test/v1", api_key="", model="m")
@@ -156,6 +194,163 @@ def test_empty_api_key_omits_header() -> None:
     _client(handler, provider=provider).complete([_USER], [])
 
     assert "x-api-key" not in seen[0].headers
+
+
+def test_cache_anchor_marks_last_block_without_leaking_marker() -> None:
+    seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
+    history = [
+        _SYSTEM,
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "stable state"},
+                {"type": "text", "text": "[3 camera frame(s) elided]"},
+            ],
+            "cache_anchor": True,
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "fresh observation"}],
+        },
+    ]
+
+    _client(handler).complete(history, [])
+
+    body = json.loads(seen[0].content)
+    anchor = body["messages"][0]["content"]
+    assert anchor[-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_anchor" not in json.dumps(body)
+
+
+def test_final_string_content_wraps_into_cached_text_block() -> None:
+    seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
+
+    _client(handler).complete([_USER], [])
+
+    assert json.loads(seen[0].content)["messages"][-1]["content"] == [
+        {
+            "type": "text",
+            "text": "Goal: pick the cube",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
+def test_cache_breakpoint_defensive_shapes_and_foreign_role_anchors() -> None:
+    non_content = {"role": "user", "content": None}
+    thinking_only = {
+        "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "private"}],
+    }
+
+    assert _with_cache_breakpoint(non_content) is non_content
+    assert _with_cache_breakpoint(thinking_only) is thinking_only
+
+    _, translated = _translate_messages(
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_1",
+                "content": "ok",
+                "cache_anchor": True,
+            },
+            {
+                "role": "assistant",
+                "content": "continued",
+                "cache_anchor": True,
+            },
+        ],
+        {},
+    )
+    assert translated[0]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert translated[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_replayed_final_assistant_breakpoint_is_copy_on_write_and_stable() -> None:
+    first = _anthropic_response(_thinking(), _text("moving"), _tool_use("toolu_1"))
+    later = _anthropic_response(_text("done"), stop_reason="end_turn")
+    seen, handler = _capture(first, later, later)
+    client = _client(handler)
+
+    message = client.complete([_USER], [])
+    history = [
+        _USER,
+        {
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [_tool_call("toolu_1", "done", message.tool_calls[0].arguments)],
+        },
+    ]
+    stored = client._raw_blocks_by_tool_use_id["toolu_1"]
+    original = json.loads(json.dumps(stored))
+
+    client.complete(history, [])
+    client.complete(history, [])
+
+    assert stored == original
+    assert all("cache_control" not in block for block in stored)
+    for request in seen[1:]:
+        replayed = json.loads(request.content)["messages"][-1]["content"]
+        assert sum("cache_control" in block for block in replayed) == 1
+
+
+def test_representative_request_has_exactly_three_cache_breakpoints() -> None:
+    seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
+    history = [
+        _SYSTEM,
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "[3 camera frame(s) elided]"}],
+            "cache_anchor": True,
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "fresh observation"}],
+        },
+    ]
+
+    _client(handler).complete(history, [])
+
+    assert json.dumps(json.loads(seen[0].content)).count('"cache_control"') == 3
+
+
+def test_anchor_and_final_coincidence_adds_one_breakpoint() -> None:
+    seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
+    history = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "[1 camera frame(s) elided]"}],
+            "cache_anchor": True,
+        }
+    ]
+
+    _client(handler).complete(history, [])
+
+    final = json.loads(seen[0].content)["messages"][-1]
+    assert json.dumps(final).count('"cache_control"') == 1
+
+
+def test_thinking_tail_places_breakpoint_on_last_non_thinking_block() -> None:
+    seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
+    client = _client(handler)
+    client._raw_blocks_by_tool_use_id["toolu_1"] = [
+        _text("moving"),
+        _tool_use("toolu_1"),
+        _thinking(),
+    ]
+    history = [
+        {
+            "role": "assistant",
+            "content": "moving",
+            "tool_calls": [_tool_call("toolu_1", "done", '{"summary":"ok"}')],
+        }
+    ]
+
+    client.complete(history, [])
+
+    blocks = json.loads(seen[0].content)["messages"][-1]["content"]
+    assert "cache_control" not in blocks[-1]
+    assert blocks[-2]["cache_control"] == {"type": "ephemeral"}
 
 
 # -- translation -----------------------------------------------------------------
@@ -439,6 +634,59 @@ def test_terminal_responses_do_not_populate_the_cache(stop_reason: str) -> None:
     assert client._raw_blocks_by_tool_use_id == {}
 
 
+def test_capture_precedes_terminal_stop_reason_raise(tmp_path: Path) -> None:
+    payload = _anthropic_response(_text("partial"), stop_reason="refusal")
+    capture = WireCapture()
+    capture.begin_trial(str(tmp_path), "run-1", "scene-e0")
+    client = _client(
+        lambda request: httpx.Response(200, json=payload),
+        capture=capture,
+    )
+
+    with pytest.raises(RuntimeError, match="refused"):
+        client.complete([_USER], [])
+
+    (row,) = _wire_rows(tmp_path)
+    assert row["status"] == 200
+    assert row["response"] == payload
+
+
+def test_capture_records_anthropic_transport_error(tmp_path: Path) -> None:
+    def offline(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("anthropic offline", request=request)
+
+    capture = WireCapture()
+    capture.begin_trial(str(tmp_path), "run-1", "scene-e0")
+    client = _client(offline, max_retries=1, capture=capture)
+
+    with pytest.raises(RuntimeError, match="anthropic offline"):
+        client.complete([_USER], [])
+
+    (row,) = _wire_rows(tmp_path)
+    assert row["status"] is None
+    assert row["response"] is None
+    assert row["error"] == "anthropic offline"
+
+
+def test_retry_after_header_overrides_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("inspect_robots_agent._anthropic.time.sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"Retry-After": "7"}, text="slow down")
+        return httpx.Response(200, json=_anthropic_response(_text("ok"), stop_reason="end_turn"))
+
+    _client(handler, backoff_s=1.0).complete([_USER], [])
+
+    assert sleeps == [7.0]
+
+
 # -- parsing ---------------------------------------------------------------------
 
 
@@ -460,6 +708,28 @@ def test_empty_text_normalizes_to_none() -> None:
     message = _client(handler).complete([_USER], [])
 
     assert message.content is None
+
+
+def test_parse_response_filters_usage_to_non_bool_int_values() -> None:
+    payload = _anthropic_response(_text("ok"), stop_reason="end_turn")
+    payload["usage"] = {
+        "input_tokens": 11,
+        "output_tokens": 3,
+        "cache_creation": {"ephemeral_5m_input_tokens": 4},
+        "service_tier": "standard_only",
+        "synthetic": True,
+    }
+
+    message = _parse_response(payload)
+
+    assert message.usage == {"input_tokens": 11, "output_tokens": 3}
+    assert "usage" not in message.raw()
+
+
+def test_parse_response_without_usage_keeps_it_none() -> None:
+    message = _parse_response(_anthropic_response(_text("ok"), stop_reason="end_turn"))
+
+    assert message.usage is None
 
 
 def test_refusal_raises_with_category() -> None:
@@ -522,8 +792,25 @@ def test_effort_4xx_names_the_accepted_values() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, text="output_config.effort: invalid value 'minimal'")
 
-    with pytest.raises(RuntimeError, match=r"none and minimal are OpenAI-only values"):
+    with pytest.raises(RuntimeError) as excinfo:
         _client(handler).complete([_USER], [], reasoning_effort="minimal")
+
+    assert "minimal is an OpenAI-only value" in str(excinfo.value)
+    assert "none and minimal" not in str(excinfo.value)
+
+
+def test_fractional_effort_is_sent_verbatim_and_its_4xx_names_the_wire_that_takes_it() -> None:
+    seen, ok_handler = _capture(_anthropic_response(_text("hi"), stop_reason="end_turn"))
+    _client(ok_handler).complete([_USER], [], reasoning_effort=0.7)
+    # Passed through unquantized: the level set is not this wire's only vocabulary
+    # to a gateway that forwards a fraction on.
+    assert json.loads(seen[0].content)["output_config"] == {"effort": 0.7}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, text="output_config.effort: Input should be 'low', 'medium'")
+
+    with pytest.raises(RuntimeError, match=r"a fractional effort needs -P wire=chat"):
+        _client(handler).complete([_USER], [], reasoning_effort=0.7)
 
 
 def test_temperature_guidance_only_when_temperature_was_sent() -> None:
@@ -698,10 +985,159 @@ def _policy(**kwargs: Any) -> LLMAgentPolicy:
     return LLMAgentPolicy(**kwargs)
 
 
-def test_policy_records_wire_speed_and_resolved_max_output_tokens() -> None:
-    policy = _policy(wire="anthropic", speed="fast")
+def test_thinkingmachines_infers_messages_wire_and_preserves_full_model_id() -> None:
+    policy = LLMAgentPolicy(
+        model="thinkingmachines/Inkling",
+        env={"TINKER_API_KEY": "tk"},
+    )
 
-    assert policy.config.wire == "anthropic"
+    assert isinstance(policy._client, AnthropicClient)
+    assert isinstance(policy.config, AgentPolicyConfig)
+    assert policy.config.wire == "messages"
+    assert policy.config.base_url == (
+        "https://tinker.thinkingmachines.dev/services/tinker-prod/anthropic/api/v1"
+    )
+    assert policy.config.model == "thinkingmachines/Inkling"
+
+
+def test_environment_model_infers_the_same_thinkingmachines_wire() -> None:
+    policy = LLMAgentPolicy(
+        env={
+            "INSPECT_ROBOTS_MODEL": "thinkingmachines/Inkling-Small",
+            "TINKER_API_KEY": "tk",
+        }
+    )
+
+    assert isinstance(policy._client, AnthropicClient)
+    assert isinstance(policy.config, AgentPolicyConfig)
+    assert policy.config.wire == "messages"
+    assert policy.config.model == "thinkingmachines/Inkling-Small"
+
+
+def test_existing_anthropic_direct_provider_stays_on_chat_by_default() -> None:
+    policy = LLMAgentPolicy(
+        model="anthropic/claude-opus-5",
+        env={"ANTHROPIC_API_KEY": "sk-ant"},
+    )
+
+    assert isinstance(policy._client, ChatClient)
+    assert isinstance(policy.config, AgentPolicyConfig)
+    assert policy.config.wire == "chat"
+    assert policy.config.base_url == "https://api.anthropic.com/v1"
+
+
+def test_thinkingmachines_messages_ladder_names_its_missing_key() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        LLMAgentPolicy(
+            model="thinkingmachines/Inkling",
+            wire="messages",
+            env={"OPENROUTER_API_KEY": "sk-or"},
+        )
+
+    assert "fix: set $TINKER_API_KEY" in str(excinfo.value)
+
+
+def test_thinkingmachines_variant_ladder_prefers_suffix_fix_over_key_advice() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        LLMAgentPolicy(
+            model="thinkingmachines/Inkling:free",
+            wire="messages",
+            env={"TINKER_API_KEY": "tk", "OPENROUTER_API_KEY": "sk-or"},
+        )
+
+    message = str(excinfo.value)
+    assert "fix: drop the OpenRouter variant suffix (-P model=thinkingmachines/Inkling)" in message
+    assert "set $TINKER_API_KEY" not in message
+
+
+def test_bare_thinkingmachines_prefix_gets_a_full_command_fix() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        LLMAgentPolicy(
+            model="thinkingmachines/",
+            wire="messages",
+            env={"TINKER_API_KEY": "tk", "OPENROUTER_API_KEY": "sk-or"},
+        )
+
+    assert "fix: pass a full model id (-P model=thinkingmachines/Inkling)" in str(excinfo.value)
+
+
+def test_explicit_messages_wire_accepts_thinkingmachines() -> None:
+    """An agreeing explicit wire must not trip the conflict guard."""
+    policy = LLMAgentPolicy(
+        model="thinkingmachines/Inkling",
+        wire="messages",
+        env={"TINKER_API_KEY": "tk"},
+    )
+
+    assert isinstance(policy._client, AnthropicClient)
+    assert isinstance(policy.config, AgentPolicyConfig)
+    assert policy.config.wire == "messages"
+    assert policy.config.model == "thinkingmachines/Inkling"
+
+
+def test_bare_thinkingmachines_id_gets_a_full_command_fix() -> None:
+    """A provider prefix used as a bare model id must not be prefixed again."""
+    with pytest.raises(ConfigError) as excinfo:
+        LLMAgentPolicy(
+            model="thinkingmachines",
+            wire="messages",
+            env={"OPENROUTER_API_KEY": "sk-or"},
+        )
+
+    message = str(excinfo.value)
+    assert "fix: pass a full model id (-P model=thinkingmachines/Inkling)" in message
+    assert "anthropic/thinkingmachines" not in message
+
+
+def test_anthropic_wire_alias_is_accepted_and_recorded_canonically() -> None:
+    policy = LLMAgentPolicy(
+        model="anthropic/claude-opus-5",
+        wire="anthropic",
+        env={"ANTHROPIC_API_KEY": "sk-ant"},
+    )
+
+    assert isinstance(policy._client, AnthropicClient)
+    assert isinstance(policy.config, AgentPolicyConfig)
+    assert policy.config.wire == "messages"
+
+
+@pytest.mark.parametrize("wire", ["chat", "responses", "gemini-live"])
+def test_thinkingmachines_explicit_wire_conflict_is_guided(wire: str) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        LLMAgentPolicy(
+            model="thinkingmachines/Inkling",
+            wire=wire,
+            env={"TINKER_API_KEY": "tk"},
+        )
+
+    message = str(excinfo.value)
+    expected = (
+        f"wire={wire!r} cannot drive thinkingmachines/* — the provider's direct "
+        "endpoint serves only the Messages API.\n"
+        "fix: drop -P wire= (thinkingmachines/* defaults to wire=messages)"
+    )
+    if wire in {"chat", "responses"}:
+        expected += (
+            ", or pass -P base_url=... (+ -P api_key_env=NAME) to route this wire "
+            "through a gateway such as OpenRouter deliberately"
+        )
+    assert message == expected
+
+
+def test_unknown_wire_lists_only_canonical_names() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        _policy(wire="unknown")
+
+    assert str(excinfo.value) == (
+        "wire must be one of ['chat', 'gemini-live', 'interactions', 'messages', "
+        "'responses'], got 'unknown'"
+    )
+
+
+def test_policy_records_wire_speed_and_resolved_max_output_tokens() -> None:
+    policy = _policy(wire="messages", speed="fast")
+
+    assert policy.config.wire == "messages"
     assert policy.config.speed == "fast"
     assert policy.config.max_output_tokens == _DEFAULT_MAX_OUTPUT_TOKENS
 
@@ -715,7 +1151,7 @@ def test_policy_passes_speed_and_cap_through_to_the_request() -> None:
     """
     seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
     policy = _policy(
-        wire="anthropic",
+        wire="messages",
         speed="fast",
         max_output_tokens=2000,
         transport=httpx.MockTransport(handler),
@@ -731,7 +1167,7 @@ def test_policy_passes_speed_and_cap_through_to_the_request() -> None:
 
 def test_policy_passes_the_default_cap_when_unset() -> None:
     seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
-    policy = _policy(wire="anthropic", transport=httpx.MockTransport(handler))
+    policy = _policy(wire="messages", transport=httpx.MockTransport(handler))
 
     policy._client.complete([_USER], [])
 
@@ -743,7 +1179,7 @@ def test_policy_passes_the_default_cap_when_unset() -> None:
 
 def test_policy_sends_the_prefix_stripped_model_id() -> None:
     seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
-    policy = _policy(wire="anthropic", transport=httpx.MockTransport(handler))
+    policy = _policy(wire="messages", transport=httpx.MockTransport(handler))
 
     policy._client.complete([_USER], [])
 
@@ -760,15 +1196,15 @@ def test_chat_wire_records_no_max_output_tokens() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"wire": "anthropic", "speed": "turbo"}, "speed must be one of"),
-        ({"wire": "anthropic", "max_output_tokens": 0}, "must be an int >= 1"),
-        ({"wire": "anthropic", "max_output_tokens": 1e5}, "must be an int >= 1"),
-        ({"wire": "anthropic", "max_output_tokens": True}, "must be an int >= 1"),
+        ({"wire": "messages", "speed": "turbo"}, "speed must be one of"),
+        ({"wire": "messages", "max_output_tokens": 0}, "must be an int >= 1"),
+        ({"wire": "messages", "max_output_tokens": 1e5}, "must be an int >= 1"),
+        ({"wire": "messages", "max_output_tokens": True}, "must be an int >= 1"),
         ({"wire": "antropic"}, "wire must be one of"),
     ],
 )
 def test_invalid_configurations_raise(kwargs: dict[str, Any], match: str) -> None:
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ConfigError, match=match):
         _policy(**kwargs)
 
 
@@ -779,13 +1215,14 @@ def test_invalid_configurations_raise(kwargs: dict[str, Any], match: str) -> Non
 def test_wire_gated_params_raise_config_error_so_the_cli_renders_them(
     kwargs: dict[str, Any],
 ) -> None:
-    with pytest.raises(ConfigError, match=r"only supported on wire='anthropic'"):
+    with pytest.raises(ConfigError, match=r"only supported on wire='messages'") as excinfo:
         _policy(**kwargs)
+    assert "fix: pass -P wire=messages" in str(excinfo.value)
 
 
 def test_misspelled_wire_reports_the_wire_not_the_speed() -> None:
     # Ordering guard: wire is validated before the params gated on it.
-    with pytest.raises(ValueError, match="wire must be one of"):
+    with pytest.raises(ConfigError, match="wire must be one of"):
         _policy(wire="antropic", speed="fast")
 
 
@@ -793,7 +1230,7 @@ def test_openrouter_fallback_is_refused_with_guidance() -> None:
     with pytest.raises(ConfigError, match=r"fix: set \$ANTHROPIC_API_KEY"):
         LLMAgentPolicy(
             model="anthropic/claude-opus-5",
-            wire="anthropic",
+            wire="messages",
             env={"OPENROUTER_API_KEY": "sk-or"},
         )
 
@@ -803,7 +1240,7 @@ def test_bare_model_id_is_told_to_add_the_prefix_not_to_set_the_key() -> None:
     with pytest.raises(ConfigError, match=r"-P model=anthropic/claude-opus-5"):
         LLMAgentPolicy(
             model="claude-opus-5",
-            wire="anthropic",
+            wire="messages",
             env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
         )
 
@@ -811,7 +1248,7 @@ def test_bare_model_id_is_told_to_add_the_prefix_not_to_set_the_key() -> None:
 def test_explicit_base_url_suppresses_the_openrouter_guard() -> None:
     policy = LLMAgentPolicy(
         model="claude-opus-5",
-        wire="anthropic",
+        wire="messages",
         base_url="http://gateway.test/v1",
         env={"OPENROUTER_API_KEY": "sk-or", "ANTHROPIC_API_KEY": "sk-ant"},
     )
@@ -820,10 +1257,10 @@ def test_explicit_base_url_suppresses_the_openrouter_guard() -> None:
 
 
 def test_non_anthropic_prefix_is_not_told_to_set_the_anthropic_key() -> None:
-    with pytest.raises(ConfigError, match=r"fix: use an anthropic/ model id"):
+    with pytest.raises(ConfigError, match=r"fix: use an anthropic/ or thinkingmachines/ model id"):
         LLMAgentPolicy(
             model="meta-llama/llama-3",
-            wire="anthropic",
+            wire="messages",
             env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
         )
 
@@ -837,7 +1274,7 @@ def test_variant_suffix_is_told_to_drop_it_not_to_set_the_key() -> None:
     ):
         LLMAgentPolicy(
             model="anthropic/claude-opus-5:free",
-            wire="anthropic",
+            wire="messages",
             env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
         )
 
@@ -854,7 +1291,7 @@ def test_bare_variant_id_is_fixed_in_one_step() -> None:
     ):
         LLMAgentPolicy(
             model="claude-opus-5:free",
-            wire="anthropic",
+            wire="messages",
             env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
         )
 
@@ -865,25 +1302,24 @@ def test_variant_strip_keeps_fine_tune_colons() -> None:
     with pytest.raises(ConfigError, match=r"-P model=anthropic/ft:gpt-4o-mini\b"):
         LLMAgentPolicy(
             model="ft:gpt-4o-mini:free",
-            wire="anthropic",
+            wire="messages",
             env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
         )
 
 
-@pytest.mark.parametrize("api_key_env", [None, "", False, 0, 0.0])
+@pytest.mark.parametrize("api_key_env", [None, ""])
 def test_falsy_api_key_env_does_not_send_the_openrouter_key_to_a_gateway(
-    api_key_env: object,
+    api_key_env: str | None,
 ) -> None:
-    # '-P api_key_env=' parses to '', and 'false'/'0' to other falsy values,
-    # all of which resolve_provider treats as unset and answers with
-    # $OPENROUTER_API_KEY. An `is None` test would hand a third-party gateway
-    # the OpenRouter secret.
+    # '-P api_key_env=' parses to '', which resolve_provider treats as unset
+    # and answers with $OPENROUTER_API_KEY. An `is None` test would hand a
+    # third-party gateway the OpenRouter secret.
     seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
     policy = LLMAgentPolicy(
         model="claude-opus-5",
-        wire="anthropic",
+        wire="messages",
         base_url="https://gw.example/v1",
-        api_key_env=api_key_env,  # type: ignore[arg-type]
+        api_key_env=api_key_env,
         transport=httpx.MockTransport(handler),
         env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
     )
@@ -894,7 +1330,7 @@ def test_falsy_api_key_env_does_not_send_the_openrouter_key_to_a_gateway(
 
 
 def test_chat_wire_gateway_keeps_the_openrouter_default() -> None:
-    # The ANTHROPIC_API_KEY default is gated on wire='anthropic'. Dropping
+    # The ANTHROPIC_API_KEY default is gated on wire='messages'. Dropping
     # that clause would ship the Anthropic key to every chat-wire gateway,
     # where OpenRouter is the documented default.
     seen, handler = _capture({"choices": [{"message": {"content": "ok"}}]})
@@ -914,19 +1350,19 @@ def test_chat_wire_gateway_keeps_the_openrouter_default() -> None:
 def test_foreign_prefix_with_a_variant_is_terminal_in_one_step() -> None:
     # Dropping the suffix would leave 'openai/gpt-5.6', still refused. The
     # prefix is the real problem, so say so first.
-    with pytest.raises(ConfigError, match=r"fix: use an anthropic/ model id"):
+    with pytest.raises(ConfigError, match=r"fix: use an anthropic/ or thinkingmachines/ model id"):
         LLMAgentPolicy(
             model="openai/gpt-5.6:free",
-            wire="anthropic",
+            wire="messages",
             env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
         )
 
 
 def test_foreign_prefix_with_an_empty_body_does_not_name_an_empty_id() -> None:
-    with pytest.raises(ConfigError, match=r"fix: use an anthropic/ model id"):
+    with pytest.raises(ConfigError, match=r"fix: use an anthropic/ or thinkingmachines/ model id"):
         LLMAgentPolicy(
             model="openai/:free",
-            wire="anthropic",
+            wire="messages",
             env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
         )
 
@@ -941,7 +1377,7 @@ def test_ids_with_nothing_usable_left_get_a_whole_command(model: str) -> None:
     ):
         LLMAgentPolicy(
             model=model,
-            wire="anthropic",
+            wire="messages",
             env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
         )
 
@@ -952,7 +1388,7 @@ def test_empty_base_url_still_hits_the_guard() -> None:
     with pytest.raises(ConfigError, match=r"resolved to OpenRouter"):
         LLMAgentPolicy(
             model="anthropic/claude-opus-5",
-            wire="anthropic",
+            wire="messages",
             base_url="",
             env={"OPENROUTER_API_KEY": "sk-or"},
         )
@@ -961,7 +1397,7 @@ def test_empty_base_url_still_hits_the_guard() -> None:
 def test_model_from_the_environment_resolves_like_the_argument() -> None:
     with pytest.raises(ConfigError, match=r"fix: prefix the model id"):
         LLMAgentPolicy(
-            wire="anthropic",
+            wire="messages",
             env={
                 "INSPECT_ROBOTS_MODEL": "claude-opus-5",
                 "ANTHROPIC_API_KEY": "sk-ant",
@@ -979,7 +1415,7 @@ def test_another_direct_provider_is_refused_not_sent_to_its_endpoint() -> None:
     ):
         LLMAgentPolicy(
             model="openai/gpt-5.6",
-            wire="anthropic",
+            wire="messages",
             env={"OPENAI_API_KEY": "sk-oai", "OPENROUTER_API_KEY": "sk-or"},
         )
 
@@ -987,15 +1423,15 @@ def test_another_direct_provider_is_refused_not_sent_to_its_endpoint() -> None:
 def test_direct_provider_guidance_uses_the_requested_id_not_the_stripped_one() -> None:
     # resolve_provider strips 'groq/', so branching on the resolved id would
     # read it as bare and suggest the nonsense 'anthropic/llama-3'.
-    with pytest.raises(ConfigError, match=r"fix: use an anthropic/ model id"):
-        LLMAgentPolicy(model="groq/llama-3", wire="anthropic", env={"GROQ_API_KEY": "sk-groq"})
+    with pytest.raises(ConfigError, match=r"fix: use an anthropic/ or thinkingmachines/ model id"):
+        LLMAgentPolicy(model="groq/llama-3", wire="messages", env={"GROQ_API_KEY": "sk-groq"})
 
 
 def test_gateway_defaults_the_key_env_to_anthropic() -> None:
     seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
     policy = LLMAgentPolicy(
         model="claude-opus-5",
-        wire="anthropic",
+        wire="messages",
         base_url="http://gateway.test/v1",
         transport=httpx.MockTransport(handler),
         env={"OPENROUTER_API_KEY": "sk-or", "ANTHROPIC_API_KEY": "sk-ant"},
@@ -1030,7 +1466,7 @@ def test_act_drives_a_multi_turn_trial_and_replays_thinking() -> None:
 
     policy = LLMAgentPolicy(
         model="anthropic/claude-opus-5",
-        wire="anthropic",
+        wire="messages",
         transport=httpx.MockTransport(handler),
         env=dict(_ENV),
     )
@@ -1040,7 +1476,8 @@ def test_act_drives_a_multi_turn_trial_and_replays_thinking() -> None:
     policy.act(Observation())
 
     first = json.loads(requests[0].content)
-    assert first["system"].startswith("You are controlling a real robot")
+    assert first["system"][0]["text"].startswith("You are controlling a real robot")
+    assert first["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert all(m["role"] != "system" for m in first["messages"])
 
     # Turn 2 carries the dropped-assistant-then-nudge shape: the text-only turn
@@ -1048,7 +1485,13 @@ def test_act_drives_a_multi_turn_trial_and_replays_thinking() -> None:
     second = json.loads(requests[1].content)
     roles = [m["role"] for m in second["messages"]]
     assert roles == ["user", "user", "user"]
-    assert second["messages"][-1]["content"] == "Respond with exactly one tool call."
+    assert second["messages"][-1]["content"] == [
+        {
+            "type": "text",
+            "text": "Respond with exactly one tool call.",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
 
     # Next act(): tool results merge into one user turn, then the observation.
     policy.act(Observation())
@@ -1071,7 +1514,7 @@ def test_explicit_api_key_env_wins_over_the_default() -> None:
     seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
     policy = LLMAgentPolicy(
         model="claude-opus-5",
-        wire="anthropic",
+        wire="messages",
         base_url="http://gateway.test/v1",
         api_key_env="OPENROUTER_API_KEY",
         transport=httpx.MockTransport(handler),
@@ -1081,3 +1524,53 @@ def test_explicit_api_key_env_wins_over_the_default() -> None:
     policy._client.complete([_USER], [])
 
     assert seen[0].headers["x-api-key"] == "sk-or"
+
+
+def test_act_marks_the_eviction_anchor_on_the_anthropic_wire() -> None:
+    """Guards the policy -> wire anchor integration end to end.
+
+    Every other anchor test hand-injects ``cache_anchor`` into history; only
+    this one exercises ``act()``'s ``mark_anchor=isinstance(...)`` wiring. If
+    that wiring silently broke (say, a wrapped client failing the isinstance
+    check), the anchor breakpoint would vanish and every hand-injected test
+    would still pass — while live runs degraded to full-prefix rewrites at
+    each eviction with no error to notice.
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = _anthropic_response(
+            _tool_use(
+                f"toolu_{len(requests)}",
+                "move_by",
+                {"deltas": {"dx": 0.01}, "note": "I see the cube and nudge toward it."},
+            )
+        )
+        return httpx.Response(200, json=payload)
+
+    embodiment = CubePickEmbodiment()
+    policy = _policy(wire="messages", transport=httpx.MockTransport(handler))
+    policy.bind(embodiment.info)
+    scene = Scene(id="s0", instruction="reach")
+    policy.reset(scene)
+    observation = embodiment.reset(scene, seed=0)
+
+    for _ in range(4):
+        policy.act(observation)
+
+    final = json.loads(requests[-1].content)
+    stub_blocks = [
+        block
+        for message in final["messages"]
+        if isinstance(message["content"], list)
+        for block in message["content"]
+        if block.get("type") == "text" and block.get("text", "").endswith("camera frame(s) elided]")
+    ]
+    # 4 cycles at the default horizon of 2 evict the two oldest observations.
+    assert len(stub_blocks) == 2
+    # The newest stub is the anchor; the breakpoint lands on the stubbed
+    # message's last block, which is the stub itself. Older stubs carry none.
+    assert stub_blocks[-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in stub_blocks[0]
+    assert b"cache_anchor" not in requests[-1].content

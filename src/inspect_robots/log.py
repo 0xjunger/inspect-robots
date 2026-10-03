@@ -8,25 +8,53 @@ guarantee enforced by golden tests in a later step).
 Immutability is *shallow*: the dataclasses are frozen and sequence fields are
 tuples, so reassigning a field or mutating the sample list is impossible — but
 dict-valued fields (``SceneResult.reduced``, the per-epoch score dicts,
-``EvalResults.metrics``, ``EvalSpec.policy_config`` / ``embodiment_info``)
-remain plain mutable dicts, and ``SceneResult.policy_transcripts`` entries are
-arbitrary mutable JSON values. Treat a log as read-only; nothing deep-freezes
-it.
+``EvalResults.metrics``, ``EvalSpec.policy_config`` / ``embodiment_info`` /
+``grader_config``, and ``SceneResult.scene_metadata``)
+remain plain mutable dicts, as do the dictionaries inside
+``SceneResult.operator_messages``. ``SceneResult.policy_transcripts`` entries
+are arbitrary mutable JSON values. Treat a log as read-only; nothing
+deep-freezes it.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
+
+
+def _json_safe_scene_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Deep-copy each JSON-encodable value and omit values encoding rejects."""
+    safe: dict[str, Any] = {}
+    for key, value in metadata.items():
+        try:
+            safe[key] = json.loads(json.dumps(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return safe
+
 
 SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
 class EvalSpec:
-    """Top-level identity and configured horizon of a reproducible eval."""
+    """Top-level identity and configured horizon of a reproducible eval.
+
+    ``max_steps`` is always the resolved integer budget used by the rollout.
+    ``max_seconds`` preserves a benchmark's declared physical-time budget when
+    that integer was derived from the embodiment's control rate.
+
+    The three optional provenance fields record what simulator build, asset
+    revision, and policy checkpoint were used, so a published number can be
+    re-derived months later even if the sim, scene assets, or policy have moved:
+
+    - ``environment_id``: simulator or hardware-rig identifier (e.g. ``"isaacsim-2026.1.0"``).
+    - ``environment_revision``: hash or tag of the scene/asset bundle (e.g. a git SHA).
+    - ``policy_checkpoint``: hash, path, or Hugging Face revision of the model checkpoint.
+    """
 
     task: str
     policy: str
@@ -38,6 +66,28 @@ class EvalSpec:
     embodiment_info: dict[str, Any] = field(default_factory=dict)
     seed: int | None = None
     max_steps: int | None = None
+    max_seconds: float | None = None
+    # Environment and checkpoint provenance (plan 0053).
+    environment_id: str | None = None
+    environment_revision: str | None = None
+    policy_checkpoint: str | None = None
+    # Appended after ``policy_checkpoint`` so the positional order of every field
+    # that predates them is preserved.
+    # The run's grader by registry name ("operator", "vlm", a plugin's own
+    # name), ``None`` when the run graded nothing. A log written before this
+    # field existed also reads back as ``None``.
+    grader: str | None = None
+    # What actually governed grading, as reported by the grader's optional
+    # ``config`` hook; ``{}`` for a grader that exposes none. Credentials are
+    # never recorded. For the builtin ``vlm`` grader these are resolved
+    # values, not the caller's inputs: the rubric has its default substituted
+    # and any ``rubric_file`` already read, and ``effort`` is the value that
+    # rides each request (``None`` omits ``reasoning_effort`` so the provider
+    # default applies, ``"none"`` asks for the minimum). Its ``rubric`` is the
+    # run-level fallback only — a scene carrying its own
+    # ``metadata["rubric"]`` overrides it for that scene, and that value is
+    # already persisted in ``SceneResult.scene_metadata``.
+    grader_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -55,22 +105,34 @@ class EvalStats:
 
 @dataclass(frozen=True)
 class SceneResult:
-    """Per-scene result: the reduced score(s) plus the raw per-epoch scores."""
+    """Persist one scene's metadata, reduced scores, and raw per-epoch records."""
 
     scene_id: str
     status: str  # "success" | "error" | "cancelled"
-    reduced: dict[str, float] = field(default_factory=dict)
-    epochs: tuple[dict[str, float], ...] = ()
+    reduced: dict[str, float | None] = field(default_factory=dict)
+    epochs: tuple[dict[str, float | None], ...] = ()
     error: str | None = None
     # What the scene asked the policy to do — makes a log self-describing.
     instruction: str | None = None
+    # JSON-safe scene metadata, copied per key so one adapter-owned object does
+    # not prevent the rest of the scene contract from being persisted.
+    scene_metadata: dict[str, Any] = field(default_factory=dict)
     # Strictly parallel to ``epochs``: the operator's verdict per recorded
     # trial, ``None`` when the trial errored or no judgement was captured.
     # Defaults keep logs written before these fields existed readable.
     operator_judgements: tuple[str | None, ...] = ()
+    # Strictly parallel to ``epochs``: which path produced each recorded
+    # operator judgement ("console", "prompt", "embodiment", "vlm"), ``None``
+    # when the trial has no judgement (errored trials, no grader, a skipped
+    # prompt) or the grader recorded one without an operator event. The default
+    # keeps older logs readable.
+    judgement_sources: tuple[str | None, ...] = ()
     # Strictly parallel to ``epochs``: qualitative operator context per trial,
     # ``None`` when no note was captured. Read by nothing that scores.
     operator_notes: tuple[str | None, ...] = ()
+    # Strictly parallel to ``epochs``: live feedback drained during each trial.
+    # Both sequence layers are tuples to preserve the log's shallow immutability.
+    operator_messages: tuple[tuple[dict[str, Any], ...], ...] = ()
     # Strictly parallel to ``epochs``: trial-specific metadata from the policy.
     trial_metadata: tuple[dict[str, Any], ...] = ()
     # Strictly parallel to ``epochs``: why each recorded trial ended, or
@@ -87,11 +149,15 @@ class EvalResults:
 
     total_scenes: int
     total_trials: int
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float | None] = field(default_factory=dict)
     # Errored trials, which are recorded but never scored (visible per-scene
     # as empty entries in ``SceneResult.epochs``). The default keeps logs
     # written before this field existed readable.
     errored_trials: int = 0
+    # Per scorer, how many trials it abstained on (``Score(value=None)``).
+    # Metrics average only judged trials, so this is the other half of the
+    # denominator. Scorers that never abstained are omitted.
+    abstentions: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -129,7 +195,11 @@ class EvalLog:
             # written before ``operator_judgements`` existed (newer reads older).
             sample["epochs"] = tuple(sample.get("epochs", ()))
             sample["operator_judgements"] = tuple(sample.get("operator_judgements", ()))
+            sample["judgement_sources"] = tuple(sample.get("judgement_sources", ()))
             sample["operator_notes"] = tuple(sample.get("operator_notes", ()))
+            sample["operator_messages"] = tuple(
+                tuple(messages) for messages in sample.get("operator_messages", ())
+            )
             sample["trial_metadata"] = tuple(sample.get("trial_metadata", ()))
             sample["termination_reasons"] = tuple(sample.get("termination_reasons", ()))
             sample["policy_transcripts"] = tuple(sample.get("policy_transcripts", ()))

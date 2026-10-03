@@ -54,7 +54,8 @@ def test_random_policy_mostly_fails(tmp_path: Path) -> None:
     )
     log = logs[0]
     assert log.status == "success"  # the eval ran fine; the policy just performs poorly
-    assert log.results.metrics["success_at_end"] < 1.0
+    success = log.results.metrics["success_at_end"]
+    assert success is not None and success < 1.0
 
 
 def test_chunked_open_loop_execution(tmp_path: Path) -> None:
@@ -104,6 +105,7 @@ def test_sink_receives_lifecycle(tmp_path: Path) -> None:
         _cubepick_task(),
         ScriptedPolicy(),
         CubePickEmbodiment(),
+        log_dir=str(tmp_path),
         sinks=[RecordingSink(str(tmp_path))],
     )
     assert events[0] == "eval_start"

@@ -30,15 +30,21 @@ Reducer = Callable[[Sequence["Score"]], "Score"]
 
 @dataclass(frozen=True)
 class Score:
-    """The outcome a scorer assigns to one trajectory."""
+    """The outcome a scorer assigns to one trajectory.
 
-    value: ScoreValue
+    A ``value`` of ``None`` means the scorer abstained: it has no verdict for
+    this trajectory, which is recorded as such rather than counted as a zero.
+    """
+
+    value: ScoreValue | None
     explanation: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
-def value_to_float(value: ScoreValue) -> float:
-    """Coerce a score value to a float for metric aggregation."""
+def value_to_float(value: ScoreValue | None) -> float | None:
+    """Coerce a score value to a float for metric aggregation; an abstention stays ``None``."""
+    if value is None:
+        return None
     if isinstance(value, bool):
         return 1.0 if value else 0.0
     if isinstance(value, int | float):
@@ -66,7 +72,7 @@ class Scorer(Protocol):
 # --------------------------------------------------------------------------- #
 # Epoch reducers: list[Score] -> Score  (namespaced separately from metrics)
 # --------------------------------------------------------------------------- #
-def _numeric(value: ScoreValue) -> float:
+def _numeric(value: ScoreValue | None) -> float:
     """Strictly coerce a value to a number for numeric reduction.
 
     Unlike [`value_to_float`][inspect_robots.scorer.value_to_float] (which is lenient for metric
@@ -74,6 +80,11 @@ def _numeric(value: ScoreValue) -> float:
     raises on a non-numeric string rather than silently coercing it to 0.0 — so a
     ``mean`` over categorical scores fails loudly instead of lying.
     """
+    if value is None:
+        raise TypeError(
+            "cannot numerically reduce an abstained score; "
+            "reduce_scores() leaves abstentions out before reducing"
+        )
     if isinstance(value, bool):
         return 1.0 if value else 0.0
     if isinstance(value, int | float):
@@ -117,8 +128,8 @@ def reduce_mode(scores: Sequence[Score]) -> Score:
 
 def pass_at_k(k: int) -> Reducer:
     """Unbiased pass@k estimator over the epoch scores (success = value >= 0.5)."""
-    if k < 1:
-        raise ValueError("k must be >= 1")
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise ValueError(f"k must be an integer >= 1, got {k!r}")
 
     def reducer(scores: Sequence[Score]) -> Score:
         n = len(scores)
@@ -154,8 +165,16 @@ def get_reducer(name: str) -> Reducer:
 
 
 def reduce_scores(name: str, scores: Sequence[Score]) -> Score:
-    """Apply the named epoch reducer to one scene's scores."""
-    return get_reducer(name)(scores)
+    """Apply the named epoch reducer to one scene's scores.
+
+    Abstained epochs (``value is None``) are left out before reducing; a scene
+    where every epoch abstained reduces to an abstention.
+    """
+    reducer = get_reducer(name)
+    voted = [s for s in scores if s.value is not None]
+    if not voted:
+        return Score(value=None)
+    return reducer(voted)
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +255,19 @@ def reached_goal_state(threshold: float = 0.05) -> Scorer:
 _OPERATOR_SUCCESS = frozenset({"success", "pass", "yes", "y", "1", "true"})
 
 
+def is_affirmative_verdict(verdict: str | None) -> bool:
+    """Whether a recorded operator judgement reads as "the trial succeeded".
+
+    The single public definition of that contract: the recognized affirmative
+    vocabulary *and* the comparison rules around it (surrounding whitespace is
+    ignored, matching is case-insensitive, and ``None`` — no judgement recorded
+    — is not affirmative). Benchmarks that grade real-world runs from operator
+    verdicts should call this rather than restate any part of it, so a change
+    here reaches every consumer at once.
+    """
+    return verdict is not None and verdict.strip().lower() in _OPERATOR_SUCCESS
+
+
 @dataclass(frozen=True)
 class _OperatorScorer:
     name: str = "operator"
@@ -245,27 +277,42 @@ class _OperatorScorer:
         # this scorer only READS it, so scoring stays reproducible from a log.
         verdict = record.operator_judgement
         if verdict is None:
+            grading_error = record.metadata.get("grading_error")
+            if grading_error:
+                # The grader tried and failed: abstain rather than score a
+                # robot failure that never happened (plan 0085).
+                return Score(value=None, explanation=f"ungraded: grader failed: {grading_error}")
             return Score(value=False, explanation="no operator judgement recorded")
-        success = verdict.strip().lower() in _OPERATOR_SUCCESS
-        return Score(value=success, explanation=f"operator verdict: {verdict!r}")
+        return Score(
+            value=is_affirmative_verdict(verdict),
+            explanation=f"operator verdict: {verdict!r}",
+        )
 
 
 def operator_scorer() -> Scorer:
-    """Score from the human operator's recorded success judgement (R6)."""
+    """Score from the recorded success judgement (R6).
+
+    A trial with no judgement scores as failure, except when the grader
+    recorded ``metadata["grading_error"]``: then the scorer abstains
+    (``Score(value=None)``), so a grading outage is excluded from the metric
+    instead of counting as robot failures.
+    """
     return _OperatorScorer()
 
 
 class VLMScorer:
     """Reserved interface (R10): score from a VLM classifier over final frames.
 
-    Implemented in a later milestone; instantiating and calling it raises so the
-    contract is visible but no half-baked behavior ships.
+    VLM judging shipped as a grader instead (R6: scorers must stay pure
+    readers of the record); instantiating and calling this raises so the
+    reserved contract stays visible without half-baked behavior.
     """
 
     name = "vlm"
 
     def __call__(self, record: TrialRecord, target: Target | None) -> Score:
-        """Fail explicitly because VLM scoring is reserved but not implemented."""
+        """Fail explicitly because VLM judging ships as the 'vlm' grader instead."""
         raise NotImplementedError(
-            "VLMScorer is a reserved interface; not implemented in this release"
+            "VLM judging ships as the 'vlm' grader (--grader vlm) with the "
+            "'operator' scorer reading its judgement"
         )

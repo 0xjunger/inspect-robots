@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+import inspect_robots_agent._llm as llm_module
 from inspect_robots.errors import ConfigError
+from inspect_robots_agent._capture import WireCapture
 from inspect_robots_agent._llm import ChatClient, resolve_provider
 
 # --- provider resolution ladder ----------------------------------------------
@@ -50,6 +53,78 @@ def test_anthropic_model_with_anthropic_key() -> None:
     assert "api.anthropic.com" in p.base_url
     assert p.api_key == "ant-key"
     assert p.model == "claude-fable-5"  # provider prefix stripped for the compat endpoint
+
+
+def test_thinkingmachines_claims_direct_on_the_messages_wire() -> None:
+    p = resolve_provider(
+        model="thinkingmachines/Inkling",
+        base_url=None,
+        api_key_env=None,
+        env={"TINKER_API_KEY": "tk", "OPENROUTER_API_KEY": "or-key"},
+        native_wires=frozenset({"chat", "messages"}),
+    )
+
+    assert p.base_url == (
+        "https://tinker.thinkingmachines.dev/services/tinker-prod/anthropic/api/v1"
+    )
+    assert p.api_key == "tk"
+    assert p.model == "thinkingmachines/Inkling"
+    assert p.wire == "messages"
+
+
+def test_default_native_wires_routes_thinkingmachines_through_openrouter() -> None:
+    p = resolve_provider(
+        model="thinkingmachines/Inkling",
+        base_url=None,
+        api_key_env=None,
+        env={"TINKER_API_KEY": "tk", "OPENROUTER_API_KEY": "or-key"},
+    )
+
+    assert p.base_url == "https://openrouter.ai/api/v1"
+    assert p.model == "thinkingmachines/Inkling"
+    assert p.wire == "chat"
+
+
+def test_thinkingmachines_without_its_key_falls_back_to_openrouter() -> None:
+    p = resolve_provider(
+        model="thinkingmachines/Inkling",
+        base_url=None,
+        api_key_env=None,
+        env={"OPENROUTER_API_KEY": "or-key"},
+        native_wires=frozenset({"chat", "messages"}),
+    )
+
+    assert p.base_url == "https://openrouter.ai/api/v1"
+    assert p.model == "thinkingmachines/Inkling"
+
+
+def test_explicit_base_url_bypasses_thinkingmachines_entry() -> None:
+    p = resolve_provider(
+        model="thinkingmachines/Inkling",
+        base_url="http://gateway.test/v1",
+        api_key_env="OPENROUTER_API_KEY",
+        env={"TINKER_API_KEY": "tk", "OPENROUTER_API_KEY": "or-key"},
+        native_wires=frozenset({"chat", "messages"}),
+    )
+
+    assert p.base_url == "http://gateway.test/v1"
+    assert p.api_key == "or-key"
+    assert p.model == "thinkingmachines/Inkling"
+    assert p.wire == "chat"
+
+
+def test_thinkingmachines_peft_checkpoint_suffix_still_claims_direct() -> None:
+    p = resolve_provider(
+        model="thinkingmachines/Inkling:peft:262144",
+        base_url=None,
+        api_key_env=None,
+        env={"TINKER_API_KEY": "tk"},
+        native_wires=frozenset({"chat", "messages"}),
+    )
+
+    assert "tinker.thinkingmachines.dev" in p.base_url
+    assert p.model == "thinkingmachines/Inkling:peft:262144"
+    assert p.wire == "messages"
 
 
 def test_openai_model_with_openai_key() -> None:
@@ -179,10 +254,27 @@ def test_bare_prefix_without_openrouter_key_is_a_guided_error() -> None:
 
 def test_guided_error_names_the_new_provider_keys() -> None:
     with pytest.raises(ConfigError) as excinfo:
-        resolve_provider(model="google/gemini-3.5-flash", base_url=None, api_key_env=None, env={})
+        resolve_provider(
+            model="google/gemini-3.5-flash",
+            base_url=None,
+            api_key_env=None,
+            env={},
+            native_wires=frozenset({"chat", "messages"}),
+        )
     message = str(excinfo.value)
     assert "GEMINI_API_KEY" in message
     assert "google/*" in message
+    assert "TINKER_API_KEY" in message
+    assert "thinkingmachines/*" in message
+
+
+def test_default_native_wire_key_hints_omit_messages_only_providers() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_provider(model="thinkingmachines/Inkling", base_url=None, api_key_env=None, env={})
+
+    message = str(excinfo.value)
+    assert "TINKER_API_KEY" not in message
+    assert "thinkingmachines/*" not in message
 
 
 def test_missing_model_is_a_guided_error() -> None:
@@ -229,6 +321,11 @@ def _client(handler: Any, **kwargs: Any) -> ChatClient:
     return ChatClient(provider, transport=httpx.MockTransport(handler), **kwargs)
 
 
+def _wire_rows(tmp_path: Path) -> list[dict[str, Any]]:
+    path = tmp_path / "wire/run-1/scene-e0/calls.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
 def test_complete_sends_wire_format_and_parses_tool_calls() -> None:
     seen: list[httpx.Request] = []
 
@@ -254,6 +351,24 @@ def test_complete_sends_wire_format_and_parses_tool_calls() -> None:
     assert call.id == "call_1"
     assert call.name == "move_joints"
     assert json.loads(call.arguments)["duration_s"] == 1.0
+
+
+def test_parse_message_preserves_tool_call_extra_content() -> None:
+    payload = _tool_call_response()
+    extra_content = {"google": {"thought_signature": "sig-blob"}}
+    payload["choices"][0]["message"]["tool_calls"][0]["extra_content"] = extra_content
+
+    message = llm_module._parse_message(payload)
+
+    (tool_call,) = message.raw()["tool_calls"]
+    assert tool_call["extra_content"] == extra_content
+
+
+def test_parse_message_omits_absent_tool_call_extra_content() -> None:
+    message = llm_module._parse_message(_tool_call_response())
+
+    (tool_call,) = message.raw()["tool_calls"]
+    assert "extra_content" not in tool_call
 
 
 def test_reasoning_effort_is_sent_when_set_and_omitted_when_none() -> None:
@@ -295,6 +410,55 @@ def test_transient_errors_retry_then_succeed() -> None:
     assert msg.tool_calls
 
 
+def test_retry_after_header_overrides_exponential_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("inspect_robots_agent._llm.time.sleep", sleeps.append)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "7"}, text="slow down")
+        return httpx.Response(200, json=_tool_call_response())
+
+    client = _client(handler, backoff_s=1.0)
+
+    client.complete(messages=[], tools=[])
+
+    assert sleeps == [7.0]
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("Wed, 21 Oct 2015 07:28:00 GMT", 10.0),
+        ("invalid", 2.0),
+        ("1.5", 2.0),
+        ("+7", 2.0),
+        ("1e2", 2.0),
+    ],
+)
+def test_retry_after_date_or_invalid_header_uses_expected_delay(
+    monkeypatch: pytest.MonkeyPatch,
+    header: str,
+    expected: float,
+) -> None:
+    monkeypatch.setattr("inspect_robots_agent._llm.time.time", lambda: 1445412470.0)
+    sleeps: list[float] = []
+    monkeypatch.setattr("inspect_robots_agent._llm.time.sleep", sleeps.append)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": header}, text="slow down")
+        return httpx.Response(200, json=_tool_call_response())
+
+    _client(handler, backoff_s=2.0).complete(messages=[], tools=[])
+
+    assert sleeps == [expected]
+
+
 def test_retries_exhausted_raises() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="down")
@@ -315,6 +479,94 @@ def test_client_error_does_not_retry() -> None:
     with pytest.raises(RuntimeError, match="bad tool schema"):
         client.complete(messages=[], tools=[])
     assert calls["n"] == 1  # 4xx is our bug, not weather; retrying can't help
+
+
+def test_capture_precedes_nonretryable_4xx_raise(tmp_path: Path) -> None:
+    capture = WireCapture()
+    capture.begin_trial(str(tmp_path), "run-1", "scene-e0")
+    client = _client(
+        lambda request: httpx.Response(400, json={"error": {"message": "bad input"}}),
+        capture=capture,
+    )
+
+    with pytest.raises(RuntimeError, match="bad input"):
+        client.complete(messages=[], tools=[])
+
+    (row,) = _wire_rows(tmp_path)
+    assert row["status"] == 400
+    assert row["response"] == {"error": {"message": "bad input"}}
+
+
+def test_capture_precedes_malformed_json_200_raise(tmp_path: Path) -> None:
+    capture = WireCapture()
+    capture.begin_trial(str(tmp_path), "run-1", "scene-e0")
+    client = _client(
+        lambda request: httpx.Response(200, text="{not-json"),
+        capture=capture,
+    )
+
+    with pytest.raises(json.JSONDecodeError):
+        client.complete(messages=[], tools=[])
+
+    (row,) = _wire_rows(tmp_path)
+    assert row["status"] == 200
+    assert row["response"] == "{not-json"
+
+
+def test_capture_precedes_wrong_shape_200_key_error(tmp_path: Path) -> None:
+    capture = WireCapture()
+    capture.begin_trial(str(tmp_path), "run-1", "scene-e0")
+    client = _client(
+        lambda request: httpx.Response(200, json={"choices": [{}]}),
+        capture=capture,
+    )
+
+    with pytest.raises(KeyError, match="message"):
+        client.complete(messages=[], tools=[])
+
+    (row,) = _wire_rows(tmp_path)
+    assert row["status"] == 200
+    assert row["response"] == {"choices": [{}]}
+
+
+def test_capture_retries_share_call_index_and_record_transport_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(200, json=_tool_call_response())
+
+    class _Clock:
+        def __init__(self) -> None:
+            self._times = iter([10.0, 10.25, 20.0, 20.5])
+
+        def time(self) -> float:
+            return next(self._times)
+
+        def sleep(self, seconds: float) -> None:
+            return None
+
+    monkeypatch.setattr(llm_module, "time", _Clock())
+    capture = WireCapture()
+    capture.begin_trial(str(tmp_path), "run-1", "scene-e0")
+    client = _client(handler, backoff_s=0.0, capture=capture)
+
+    client.complete(messages=[], tools=[])
+
+    rows = _wire_rows(tmp_path)
+    assert [(row["call"], row["attempt"]) for row in rows] == [(0, 0), (0, 1)]
+    assert [row["t"] for row in rows] == [10.0, 20.0]
+    assert [row["duration_s"] for row in rows] == [0.25, 0.5]
+    assert rows[0]["status"] is None
+    assert rows[0]["response"] is None
+    assert rows[0]["error"] == "offline"
+    assert rows[1]["status"] == 200
+    assert "error" not in rows[1]
 
 
 def test_reasoning_tools_rejection_has_responses_wire_guidance() -> None:

@@ -29,9 +29,13 @@ class Observation:
     ``images`` are keyed by camera name; ``state`` holds proprioception keyed by a
     controlled vocabulary (e.g. ``"eef_pos"``, ``"gripper"``). ``instruction`` is
     the language goal for this step (usually constant across an episode, but may
-    change for long-horizon tasks). The rollout injects the current step into the
-    policy-facing observation's ``extra["env_step"]`` and reserves that key;
-    embodiments should not set it.
+    change for long-horizon tasks). The rollout injects ``extra["env_step"]`` (int),
+    ``extra["approvals"]`` (list of ``{"t": int, "detail": str | None}`` records for
+    safety interventions since the previous ``act()`` call), and
+    ``extra["operator_messages"]`` (list of
+    ``{"t": int, "text": str, "source": str}`` records for live feedback since the
+    previous ``act()`` call) into the policy-facing observation and reserves those keys;
+    embodiments should not set them.
     """
 
     images: Mapping[str, ImageArray] = field(default_factory=dict)
@@ -80,14 +84,22 @@ class ActionChunk:
         return len(self.actions)
 
 
+# Standard termination reason for "a human operator ended this episode by
+# keypress, without giving a verdict". Non-definitive on purpose: the verdict
+# (y/n/partial/skip + optional grader note) is collected by the CLI's operator
+# prompt, which fires for attended trials that end with this reason (#194).
+OPERATOR_END = "operator_end"
+
+
 @dataclass(frozen=True, eq=False)
 class StepResult:
     """The outcome of applying one action to an embodiment.
 
     ``terminated`` means the task ended (success or hard failure);
     ``termination_reason`` disambiguates (e.g. ``"success"``, ``"collision"``,
-    ``"fault"``, ``"out_of_bounds"``). ``truncated`` means a time/horizon cutoff.
-    A simulator may expose privileged success via ``info``.
+    ``"fault"``, ``"out_of_bounds"``, ``"operator_end"`` — the standard reason
+    for operator-ended episodes awaiting a verdict). ``truncated`` means a
+    time/horizon cutoff. A simulator may expose privileged success via ``info``.
     """
 
     observation: Observation
